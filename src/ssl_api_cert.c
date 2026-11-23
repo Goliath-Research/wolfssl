@@ -1643,6 +1643,10 @@ WOLFSSL_X509_STORE* wolfSSL_CTX_get_cert_store(const WOLFSSL_CTX* ctx)
  * wolfSSL_X509_STORE_up_ref(). A reference is added to the store's
  * certificate manager, which the context then uses as its own.
  *
+ * A store that is not reference counted - one that is part of another
+ * context - is not taken: nothing would keep it alive once its owner is
+ * freed.
+ *
  * @param [in, out] ctx  SSL/TLS context.
  * @param [in]      str  X509 certificate store to use.
  */
@@ -1653,6 +1657,9 @@ void wolfSSL_CTX_set_cert_store(WOLFSSL_CTX* ctx, WOLFSSL_X509_STORE* str)
     /* Validate parameters. */
     if ((ctx == NULL) || (str == NULL) || (ctx->cm == str->cm)) {
         WOLFSSL_MSG("Invalid parameters");
+    }
+    else if (!str->isDynamic) {
+        WOLFSSL_MSG("Store is not reference counted");
     }
     else if (wolfSSL_CertManager_up_ref(str->cm) != 1) {
         WOLFSSL_MSG("wolfSSL_CertManager_up_ref error");
@@ -1704,10 +1711,16 @@ void wolfSSL_CTX_set_cert_store(WOLFSSL_CTX* ctx, WOLFSSL_X509_STORE* str)
  * clear on NULL, because an object reverts to the context's store rather than
  * having a second store of its own to throw away.
  *
+ * A store that is not reference counted - one that is part of another
+ * context - is refused too, as nothing would keep it alive once its owner is
+ * freed. The context's own store is accepted as a no-op when it is the one
+ * in use.
+ *
  * @param [in] ctx  SSL/TLS context.
  * @param [in] str  Certificate store. NULL is refused.
  * @return  1 on success.
- * @return  0 when ctx or str is NULL, or on other error.
+ * @return  0 when ctx or str is NULL, str is not reference counted, or on
+ *          other error.
  */
 int wolfSSL_CTX_set1_verify_cert_store(WOLFSSL_CTX* ctx,
     WOLFSSL_X509_STORE* str)
@@ -1734,9 +1747,15 @@ int wolfSSL_CTX_set1_verify_cert_store(WOLFSSL_CTX* ctx,
     else if (str == CTX_STORE(ctx)) {
         ret = 1;
     }
+    /* A store that is part of another object has no reference count to take,
+     * and wolfSSL_X509_STORE_up_ref() reports success for it regardless, so
+     * keeping the pointer would leave nothing protecting it. */
+    else if (!str->isDynamic) {
+        WOLFSSL_MSG("Store is not reference counted");
+        ret = 0;
+    }
     /* Take a reference so the pointer can be stored and released with the
-     * context. A store that is part of another object has none to take - the
-     * pointer is then kept without anything protecting it. */
+     * context. */
     else if (wolfSSL_X509_STORE_up_ref(str) != 1) {
         WOLFSSL_MSG("wolfSSL_X509_STORE_up_ref error");
         ret = 0;
@@ -1781,9 +1800,10 @@ int wolfSSL_CTX_set1_verify_cert_store(WOLFSSL_CTX* ctx,
  * reference a misusing caller never took.
  *
  * A store that is part of another object has no reference count to take, so
- * nothing keeps it alive for as long as the pointer is held here - see
- * wolfSSL_X509_STORE_up_ref(). Storing one that belongs to a different
- * object outlives its owner only by luck.
+ * nothing would keep it alive for as long as the pointer is held here - see
+ * wolfSSL_X509_STORE_up_ref(). Such a store is refused, with set0 and set1
+ * alike, unless it is the one the context already uses, which keeps no
+ * pointer.
  *
  * A set0 caller must therefore own a reference. Handing over a borrowed
  * pointer, such as one straight from wolfSSL_CTX_get_cert_store(), releases
@@ -1809,7 +1829,8 @@ int wolfSSL_CTX_set1_verify_cert_store(WOLFSSL_CTX* ctx,
  * @param [in]      str  X509 certificate store to use. NULL to clear.
  * @param [in]      ref  Whether to take a reference to the store.
  * @return  1 on success.
- * @return  0 when ssl is NULL, or the reference cannot be taken.
+ * @return  0 when ssl is NULL, str is not reference counted, or the
+ *          reference cannot be taken.
  */
 static int wolfssl_set_verify_cert_store(WOLFSSL *ssl, WOLFSSL_X509_STORE* str,
     int ref)
@@ -1833,6 +1854,14 @@ static int wolfssl_set_verify_cert_store(WOLFSSL *ssl, WOLFSSL_X509_STORE* str,
      * the OpenSSL compatibility layer. */
     else if (str == SSL_STORE(ssl)) {
         ret = 1;
+    }
+    /* A store with no reference count can only be pinned by pointer, which
+     * nothing keeps valid once the object it is part of is freed. The
+     * context's store is kept by no pointer below, so it is still accepted. */
+    else if ((str != NULL) && !str->isDynamic &&
+             (str != CTX_STORE(ssl->ctx))) {
+        WOLFSSL_MSG("Store is not reference counted");
+        ret = 0;
     }
     /* Take the reference to become responsible for before releasing the one
      * the object holds below. The two name different stores - the store the
