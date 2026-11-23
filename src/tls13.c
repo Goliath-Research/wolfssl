@@ -13878,9 +13878,18 @@ static int SendTls13NewSessionTicket(WOLFSSL* ssl)
             ssl->session->ticketNonce.data[0]++;
     }
 
-    if ((ssl->options.mask & WOLFSSL_OP_NO_TICKET) != 0) {
-        /* In this case we only send the ID as the ticket. Let's generate a new
-         * ID for the new ticket so that we don't overwrite any old ones */
+#ifndef WOLFSSL_TICKET_HAVE_ID
+    if ((ssl->options.mask & WOLFSSL_OP_NO_TICKET) != 0)
+#endif
+    #ifdef WOLFSSL_ASYNC_CRYPT
+    if (ssl->error != WC_NO_ERR_TRACE(WC_PENDING_E))
+    #endif
+    {
+        /* Generate a new ID for every ticket so that we don't overwrite any
+         * old ones. When the ID is the ticket or is carried in it, it is also
+         * the cache key that makes 0-RTT single-use: reusing the ID of the
+         * ticket this connection resumed with would put the consumed entry
+         * back in the cache. */
         ret = wc_RNG_GenerateBlock(ssl->rng, ssl->session->altSessionID,
                                    ID_LEN);
         if (ret != 0)

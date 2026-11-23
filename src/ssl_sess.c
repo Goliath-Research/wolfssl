@@ -3335,8 +3335,11 @@ static void SESSION_ex_data_cache_update(WOLFSSL_SESSION* session, int idx,
 
 #ifndef NO_SESSION_CACHE
 /* OpenSSL-compatible return: 1 if the session was found and removed from the
- * internal cache, or if the external remove callback (rem_sess_cb) was
- * invoked. 0 if neither applied (not present, or null arguments). */
+ * internal cache, 0 otherwise (not present, internal cache off, or null
+ * arguments). The remove callback (rem_sess_cb) is only a notification and
+ * does not affect the return value: it cannot report whether an external
+ * cache held the session, and the TLS 1.3 0-RTT single-use check relies on
+ * this result. */
 int wolfSSL_SSL_CTX_remove_session(WOLFSSL_CTX *ctx, WOLFSSL_SESSION *s)
 {
     int found = 0;
@@ -3404,8 +3407,6 @@ int wolfSSL_SSL_CTX_remove_session(WOLFSSL_CTX *ctx, WOLFSSL_SESSION *s)
 #if defined(HAVE_EXT_CACHE) || defined(HAVE_EX_DATA)
     if (ctx->rem_sess_cb != NULL && !rem_called) {
         ctx->rem_sess_cb(ctx, s);
-        /* Assume the external cache had the session. */
-        found = 1;
     }
 #endif
 
