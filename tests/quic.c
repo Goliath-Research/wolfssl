@@ -2091,6 +2091,10 @@ static int test_quic_early_data(int verbose) {
     ExpectIntEQ(wolfSSL_get_early_data_status(tclient.ssl),
                 WOLFSSL_EARLY_DATA_ACCEPTED);
 
+    /* 0-RTT tickets are single-use: resume with the new ticket. */
+    wolfSSL_SESSION_free(session);
+    session = NULL;
+    ExpectNotNull(session = wolfSSL_get1_session(tclient.ssl));
     QuicTestContext_free(&tclient);
     QuicTestContext_free(&tserver);
 

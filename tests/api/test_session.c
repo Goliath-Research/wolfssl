@@ -759,9 +759,9 @@ static WC_MAYBE_UNUSED int test_wolfSSL_CTX_add_session_ext(
                     /* (D)TLSv1.3 creates a new ticket,
                      * updates both internal and external cache */
                     ExpectIntEQ(twcase_new_session_called, 1);
-                    /* Called on session added in
-                     * twcase_server_sess_ctx_pre_shutdown and by wolfSSL */
-                    ExpectIntEQ(twcase_remove_session_called, 1);
+                    /* A new session ID is created for a new ticket, so the
+                     * flush evicts both cache entries */
+                    ExpectIntEQ(twcase_remove_session_called, 2);
                 }
                 else {
                     /* non (D)TLSv1.3 case */
