@@ -444,6 +444,25 @@
     #define HASH_MAX_STATESIZE HASH_MAX_DESCSIZE
 #endif
 
+/* Upper bound on heap working-state nodes per tfm for the SHA-3 and HMAC
+ * shashes, whose state is too large for the desc.  The kernel frees descs
+ * without calling .final (algif_hash frees an accepted socket's request on
+ * close), so an abandoned desc is indistinguishable from an idle live one, and
+ * without a bound close(accept(fd)) in a loop grows the tfm's list until
+ * exit_tfm.  At the bound, the least recently used idle node is evicted; a desc
+ * whose node was evicted gets -EINVAL on its next call, never a stale access.
+ * Must be at least 2, since export->import needs two live working states.
+ * Override at build time if a workload keeps more descs per tfm in flight.
+ *
+ * Note the default expression is runtime-evaluated to scale with host size.
+ */
+#ifndef WC_LINUXKM_HASH_DESC_LIST_MAX
+    #define WC_LINUXKM_HASH_DESC_LIST_MAX (nr_cpu_ids * 2)
+#else
+    wc_static_assert_if_const(WC_LINUXKM_HASH_DESC_LIST_MAX > 1,
+                              "WC_LINUXKM_HASH_DESC_LIST_MAX must be at least 2.");
+#endif
+
 #if defined(WOLFSSL_SHA3) && \
     (defined(LINUXKM_LKCAPI_REGISTER_SHA3_224) || \
      defined(LINUXKM_LKCAPI_REGISTER_SHA3_256) || \
@@ -466,16 +485,25 @@ struct km_sha3_state {
 #endif
         struct wc_Sha3 sha3_state;
     };
-    /* pointers for the cleanup list */
+    /* linkage for the tfm-owned desc_list */
     struct list_head desc_ent;
+    word64 desc_id;
+    /* nonzero while a desc call uses the sponge outside desc_list_lock */
+    unsigned int busy;
 };
 
-/* struct wc_Sha3 won't fit in HASH_MAX_DESCSIZE. */
-struct km_sha3_state_by_pointer {
-    struct km_sha3_state *sha3_state;
+/* struct wc_Sha3 won't fit in HASH_MAX_DESCSIZE, so the working state lives in
+ * a node on the tfm's desc_list, and the desc holds only a handle to it.  The
+ * handle is matched by value against desc_list and never dereferenced: the
+ * kernel can free a desc without calling .final, or hand us one whose ctx is
+ * stale or uninitialized, and its node can be evicted while the desc is idle.
+ */
+struct km_sha3_desc_ctx {
+    word64 tfm_cookie;
+    word64 desc_id;
 };
 
-wc_static_assert(sizeof(struct km_sha3_state_by_pointer) <= HASH_MAX_DESCSIZE);
+wc_static_assert(sizeof(struct km_sha3_desc_ctx) <= HASH_MAX_DESCSIZE);
 
 #ifdef WOLFSSL_LINUXKM_USE_MUTEXES
     #error LINUXKM_LKCAPI_REGISTER_SHA3 requires spinlock-based mutexes.
@@ -492,8 +520,17 @@ PRAGMA("GCC diagnostic ignored \"-Wnested-externs\"");
 #include <linux/list.h>
 
 struct km_Sha3TfmCtx {
+    /* desc_list_lock guards desc_list, desc_list_len, cur_desc_id, and the
+     * busy count of every node on desc_list.
+     */
     wolfSSL_Mutex desc_list_lock;
+    /* working states of live and abandoned descs, most recently used first,
+     * bounded by WC_LINUXKM_HASH_DESC_LIST_MAX
+     */
     struct list_head desc_list;
+    unsigned int desc_list_len;
+    word64 cur_desc_id;
+    word64 tfm_cookie;
 };
 
 WC_MAYBE_UNUSED static int km_sha3_init_tfm(struct crypto_shash *tfm)
@@ -502,6 +539,9 @@ WC_MAYBE_UNUSED static int km_sha3_init_tfm(struct crypto_shash *tfm)
     if (wc_InitMutex(&t_ctx->desc_list_lock) != 0)
         return -EINVAL;
     INIT_LIST_HEAD(&t_ctx->desc_list);
+    t_ctx->desc_list_len = 0;
+    t_ctx->cur_desc_id = 0;
+    t_ctx->tfm_cookie = get_random_u64();
     return 0;
 }
 
@@ -530,48 +570,166 @@ WC_MAYBE_UNUSED static void km_sha3_exit_tfm(struct crypto_shash *tfm)
     (void)wc_FreeMutex(&t_ctx->desc_list_lock);
 }
 
-WC_MAYBE_UNUSED static int km_sha3_alloc_tstate(struct shash_desc *desc) {
+/* Returns a zeroed node, not yet on desc_list.  Zeroing makes it
+ * unconditionally safe for wc_Sha3_256_Free() (currently a no-op in kernel
+ * configs, but that could change).
+ */
+WC_MAYBE_UNUSED static struct km_sha3_state *km_sha3_alloc_tstate(void) {
+    struct km_sha3_state *node =
+        (struct km_sha3_state *)malloc(sizeof(struct km_sha3_state));
+    if (node != NULL)
+        XMEMSET(node, 0, sizeof *node);
+    return node;
+}
+
+WC_MAYBE_UNUSED static void km_sha3_free_node(struct km_sha3_state *node) {
+    wc_Sha3_256_Free(&node->sha3_state);
+    ForceZero(node, sizeof *node);
+    free(node);
+}
+
+/* Caller holds desc_list_lock. */
+WC_MAYBE_UNUSED static struct km_sha3_state *km_sha3_find_tstate_locked(
+    struct km_Sha3TfmCtx *t_ctx, const struct km_sha3_desc_ctx *d_ctx)
+{
+    struct km_sha3_state *node_i;
+
+    if (d_ctx->tfm_cookie != t_ctx->tfm_cookie)
+        return NULL;
+    list_for_each_entry(node_i, &t_ctx->desc_list, desc_ent) {
+        if (node_i->desc_id == d_ctx->desc_id)
+            return node_i;
+    }
+    return NULL;
+}
+
+/* Makes newnode (not yet on desc_list) the desc's working state, taking
+ * ownership of it.  Under the same lock hold, the desc's prior node (if its
+ * handle still names one) and, at WC_LINUXKM_HASH_DESC_LIST_MAX, the least
+ * recently used idle nodes are unlinked; they are freed after unlocking.
+ */
+WC_MAYBE_UNUSED static int km_sha3_install_tstate(struct shash_desc *desc,
+                                                  struct km_sha3_state *newnode)
+{
     struct km_Sha3TfmCtx *t_ctx =
         (struct km_Sha3TfmCtx *)crypto_shash_ctx(desc->tfm);
-    struct km_sha3_state_by_pointer *s_ctx = (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);
-    s_ctx->sha3_state = (struct km_sha3_state *)malloc(sizeof(struct km_sha3_state));
-    if (! s_ctx->sha3_state)
-        return -ENOMEM;
+    struct km_sha3_desc_ctx *d_ctx =
+        (struct km_sha3_desc_ctx *)shash_desc_ctx(desc);
+    struct km_sha3_state *node_i;
+    struct km_sha3_state *next_ent;
+    struct list_head *pos;
+    struct list_head reap;
 
-    /* Must zero here to make unconditionally safe for wc_Sha3_256_Free() in
-     * km_sha3_exit_tfm() (currently a no-op in kernel configs, but that could
-     * change).
-     */
-    XMEMSET(&s_ctx->sha3_state->sha3_state, 0, sizeof s_ctx->sha3_state->sha3_state);
+    INIT_LIST_HEAD(&reap);
+    newnode->busy = 0;
 
     if (wc_LockMutex(&t_ctx->desc_list_lock) != 0) {
-        free(s_ctx->sha3_state);
-        s_ctx->sha3_state = NULL;
+        km_sha3_free_node(newnode);
         return -EINVAL;
     }
-    list_add(&s_ctx->sha3_state->desc_ent, &t_ctx->desc_list);
+
+    node_i = km_sha3_find_tstate_locked(t_ctx, d_ctx);
+    if ((node_i != NULL) && (node_i->busy == 0)) {
+        list_del(&node_i->desc_ent);
+        --t_ctx->desc_list_len;
+        list_add(&node_i->desc_ent, &reap);
+    }
+
+    pos = t_ctx->desc_list.prev;
+    while ((t_ctx->desc_list_len >= WC_LINUXKM_HASH_DESC_LIST_MAX) &&
+           (pos != &t_ctx->desc_list))
+    {
+        node_i = list_entry(pos, struct km_sha3_state, desc_ent);
+        pos = pos->prev;
+        if (node_i->busy != 0)
+            continue;
+        list_del(&node_i->desc_ent);
+        --t_ctx->desc_list_len;
+        list_add(&node_i->desc_ent, &reap);
+    }
+
+    newnode->desc_id = t_ctx->cur_desc_id++;
+    list_add(&newnode->desc_ent, &t_ctx->desc_list);
+    ++t_ctx->desc_list_len;
+    d_ctx->tfm_cookie = t_ctx->tfm_cookie;
+    d_ctx->desc_id = newnode->desc_id;
+
     (void)wc_UnLockMutex(&t_ctx->desc_list_lock);
+
+    list_for_each_entry_safe(node_i, next_ent, &reap, desc_ent) {
+        list_del(&node_i->desc_ent);
+        km_sha3_free_node(node_i);
+    }
 
     return 0;
 }
 
-WC_MAYBE_UNUSED static void km_sha3_free_tstate(struct shash_desc *desc) {
+/* Looks up the desc's working state, marks it most recently used, and holds it
+ * against eviction until km_sha3_put_tstate().  NULL if the desc has none
+ * (never initialized, finalized, or evicted).
+ */
+WC_MAYBE_UNUSED static struct km_sha3_state *km_sha3_get_tstate(
+    struct shash_desc *desc)
+{
     struct km_Sha3TfmCtx *t_ctx =
         (struct km_Sha3TfmCtx *)crypto_shash_ctx(desc->tfm);
-    struct km_sha3_state_by_pointer *s_ctx = (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);
+    struct km_sha3_state *node;
 
-    if (s_ctx->sha3_state == NULL)
-        return;
+    if (wc_LockMutex(&t_ctx->desc_list_lock) != 0)
+        return NULL;
+    node = km_sha3_find_tstate_locked(
+        t_ctx, (const struct km_sha3_desc_ctx *)shash_desc_ctx(desc));
+    if (node != NULL) {
+        ++node->busy;
+        list_del(&node->desc_ent);
+        list_add(&node->desc_ent, &t_ctx->desc_list);
+    }
+    (void)wc_UnLockMutex(&t_ctx->desc_list_lock);
+
+    return node;
+}
+
+WC_MAYBE_UNUSED static void km_sha3_put_tstate(struct shash_desc *desc,
+                                               struct km_sha3_state *node)
+{
+    struct km_Sha3TfmCtx *t_ctx =
+        (struct km_Sha3TfmCtx *)crypto_shash_ctx(desc->tfm);
 
     if (wc_LockMutex(&t_ctx->desc_list_lock) != 0)
         return;
-    list_del(&s_ctx->sha3_state->desc_ent);
+    --node->busy;
+    (void)wc_UnLockMutex(&t_ctx->desc_list_lock);
+}
+
+/* Unlinks the desc's working state for exclusive use by the caller, who must
+ * free it with km_sha3_free_node().
+ */
+WC_MAYBE_UNUSED static struct km_sha3_state *km_sha3_take_tstate(
+    struct shash_desc *desc)
+{
+    struct km_Sha3TfmCtx *t_ctx =
+        (struct km_Sha3TfmCtx *)crypto_shash_ctx(desc->tfm);
+    struct km_sha3_state *node;
+
+    if (wc_LockMutex(&t_ctx->desc_list_lock) != 0)
+        return NULL;
+    node = km_sha3_find_tstate_locked(
+        t_ctx, (const struct km_sha3_desc_ctx *)shash_desc_ctx(desc));
+    if ((node != NULL) && (node->busy != 0))
+        node = NULL;
+    if (node != NULL) {
+        list_del(&node->desc_ent);
+        --t_ctx->desc_list_len;
+    }
     (void)wc_UnLockMutex(&t_ctx->desc_list_lock);
 
-    wc_Sha3_256_Free(&s_ctx->sha3_state->sha3_state);
-    ForceZero(s_ctx->sha3_state, sizeof *s_ctx->sha3_state);
-    free(s_ctx->sha3_state);
-    s_ctx->sha3_state = NULL;
+    return node;
+}
+
+WC_MAYBE_UNUSED static void km_sha3_free_tstate(struct shash_desc *desc) {
+    struct km_sha3_state *node = km_sha3_take_tstate(desc);
+    if (node != NULL)
+        km_sha3_free_node(node);
 }
 
 WC_MAYBE_UNUSED static int sha3_test_once(void) {
@@ -611,25 +769,31 @@ wc_static_assert(sizeof(struct km_sha3_export_state) <= HASH_MAX_STATESIZE);
  * member, so the generic .sha3_state accessor serves all four. */
 WC_MAYBE_UNUSED static int km_sha3_export(struct shash_desc *desc, void *out)
 {
-    struct km_sha3_state_by_pointer *ctx = (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);
     struct km_sha3_export_state *blob = (struct km_sha3_export_state *)out;
+    struct km_sha3_state *node;
     const struct wc_Sha3 *sha3;
+    int ret = 0;
 
-    if (ctx->sha3_state == NULL)
+    node = km_sha3_get_tstate(desc);
+    if (node == NULL)
         return -EINVAL;
-    sha3 = &ctx->sha3_state->sha3_state;
+    sha3 = &node->sha3_state;
 
     /* i < rate <= sizeof(blob->t) always; guard defensively so a corrupted
      * live state can't overrun blob->t. */
-    if (sha3->i > sizeof(blob->t))
-        return -EINVAL;
+    if (sha3->i > sizeof(blob->t)) {
+        ret = -EINVAL;
+    }
+    else {
+        XMEMCPY(blob->s, sha3->s, sizeof(blob->s));
+        XMEMSET(blob->t, 0, sizeof(blob->t));
+        XMEMCPY(blob->t, sha3->t, sha3->i);
+        blob->i = (byte)sha3->i;
+    }
 
-    XMEMCPY(blob->s, sha3->s, sizeof(blob->s));
-    XMEMSET(blob->t, 0, sizeof(blob->t));
-    XMEMCPY(blob->t, sha3->t, sha3->i);
-    blob->i = (byte)sha3->i;
+    km_sha3_put_tstate(desc, node);
 
-    return 0;
+    return ret;
 }
 
 /* Kernel-API export/import test coverage.  Exercises the cross-desc path that
@@ -1059,29 +1223,30 @@ struct wc_swallow_the_semicolon
                                                                            \
                                                                            \
 static int km_ ## name ## _init(struct shash_desc *desc) {                 \
-    struct km_sha3_state_by_pointer *ctx =                                 \
-        (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);           \
+    struct km_sha3_state *node;                                            \
     int ret;                                                               \
                                                                            \
-    ret = km_sha3_alloc_tstate(desc);                                      \
-    if (ret)                                                               \
-        return ret;                                                        \
-    ret = init_f(&ctx->sha3_state-> name ## _state, NULL, INVALID_DEVID);  \
-    if (ret == 0)                                                          \
-        return 0;                                                          \
-    else {                                                                 \
-        km_sha3_free_tstate(desc);                                         \
+    node = km_sha3_alloc_tstate();                                         \
+    if (node == NULL)                                                      \
+        return -ENOMEM;                                                    \
+    ret = init_f(&node-> name ## _state, NULL, INVALID_DEVID);             \
+    if (ret != 0) {                                                        \
+        km_sha3_free_node(node);                                           \
         return -EINVAL;                                                    \
     }                                                                      \
+    return km_sha3_install_tstate(desc, node);                             \
 }                                                                          \
                                                                            \
 static int km_ ## name ## _update(struct shash_desc *desc, const u8 *data, \
                                   unsigned int len)                        \
 {                                                                          \
-    struct km_sha3_state_by_pointer *ctx =                                 \
-        (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);           \
+    struct km_sha3_state *node = km_sha3_get_tstate(desc);                 \
+    int ret;                                                               \
                                                                            \
-    int ret = update_f(&ctx->sha3_state-> name ## _state, data, len);      \
+    if (node == NULL)                                                      \
+        return -EINVAL;                                                    \
+    ret = update_f(&node-> name ## _state, data, len);                     \
+    km_sha3_put_tstate(desc, node);                                        \
                                                                            \
     if (ret == 0)                                                          \
         return 0;                                                          \
@@ -1092,12 +1257,14 @@ static int km_ ## name ## _update(struct shash_desc *desc, const u8 *data, \
 }                                                                          \
                                                                            \
 static int km_ ## name ## _final(struct shash_desc *desc, u8 *out) {       \
-    struct km_sha3_state_by_pointer *ctx =                                 \
-        (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);           \
+    struct km_sha3_state *node = km_sha3_take_tstate(desc);                \
+    int ret;                                                               \
                                                                            \
-    int ret = final_f(&ctx->sha3_state-> name ## _state, out);             \
+    if (node == NULL)                                                      \
+        return -EINVAL;                                                    \
+    ret = final_f(&node-> name ## _state, out);                            \
+    km_sha3_free_node(node);                                               \
                                                                            \
-    km_sha3_free_tstate(desc);                                             \
     if (ret == 0)                                                          \
         return 0;                                                          \
     else                                                                   \
@@ -1107,17 +1274,20 @@ static int km_ ## name ## _final(struct shash_desc *desc, u8 *out) {       \
 static int km_ ## name ## _finup(struct shash_desc *desc, const u8 *data,  \
                                  unsigned int len, u8 *out)                \
 {                                                                          \
-    struct km_sha3_state_by_pointer *ctx =                                 \
-        (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);           \
+    struct km_sha3_state *node = km_sha3_take_tstate(desc);                \
+    int ret;                                                               \
                                                                            \
-    int ret = update_f(&ctx->sha3_state-> name ## _state, data, len);      \
-                                                                           \
-    if (ret != 0) {                                                        \
-        km_sha3_free_tstate(desc);                                         \
+    if (node == NULL)                                                      \
         return -EINVAL;                                                    \
-    }                                                                      \
+    ret = update_f(&node-> name ## _state, data, len);                     \
+    if (ret == 0)                                                          \
+        ret = final_f(&node-> name ## _state, out);                        \
+    km_sha3_free_node(node);                                               \
                                                                            \
-    return km_ ## name ## _final(desc, out);                               \
+    if (ret == 0)                                                          \
+        return 0;                                                          \
+    else                                                                   \
+        return -EINVAL;                                                    \
 }                                                                          \
                                                                            \
 static int km_ ## name ## _digest(struct shash_desc *desc, const u8 *data, \
@@ -1143,24 +1313,23 @@ static int km_ ## name ## _digest(struct shash_desc *desc, const u8 *data, \
 static int km_ ## name ## _import(struct shash_desc *desc,                 \
                                   const void *in)                          \
 {                                                                          \
-    struct km_sha3_state_by_pointer *ctx =                                 \
-        (struct km_sha3_state_by_pointer *)shash_desc_ctx(desc);           \
     const struct km_sha3_export_state *blob =                              \
         (const struct km_sha3_export_state *)in;                           \
+    struct km_sha3_state *node;                                            \
     struct wc_Sha3 *sha3;                                                  \
     int ret;                                                               \
                                                                            \
     if (blob->i >= (block_size))                                           \
         return -EINVAL;                                                    \
                                                                            \
-    ret = km_sha3_alloc_tstate(desc);                                      \
-    if (ret)                                                               \
-        return ret;                                                        \
+    node = km_sha3_alloc_tstate();                                         \
+    if (node == NULL)                                                      \
+        return -ENOMEM;                                                    \
                                                                            \
-    sha3 = &ctx->sha3_state-> name ## _state;                              \
+    sha3 = &node-> name ## _state;                                         \
     ret = init_f(sha3, NULL, INVALID_DEVID);                               \
     if (ret != 0) {                                                        \
-        km_sha3_free_tstate(desc);                                         \
+        km_sha3_free_node(node);                                           \
         return -EINVAL;                                                    \
     }                                                                      \
                                                                            \
@@ -1169,7 +1338,7 @@ static int km_ ## name ## _import(struct shash_desc *desc,                 \
     XMEMSET(sha3->t + blob->i, 0, sizeof(sha3->t) - blob->i);              \
     sha3->i = blob->i;                                                     \
                                                                            \
-    return 0;                                                              \
+    return km_sha3_install_tstate(desc, node);                             \
 }                                                                          \
                                                                            \
 wc_static_assert((block_size) <=                                           \
@@ -1185,7 +1354,7 @@ static struct shash_alg name ## _alg =                                     \
     .final          =       km_ ## name ## _final,                         \
     .finup          =       km_ ## name ## _finup,                         \
     .digest         =       km_ ## name ## _digest,                        \
-    .descsize       =       sizeof(struct km_sha3_state_by_pointer),       \
+    .descsize       =       sizeof(struct km_sha3_desc_ctx),               \
     .export         =       km_sha3_export,                                \
     .import         =       km_ ## name ## _import,                        \
     .statesize      =       sizeof(struct km_sha3_export_state),           \
@@ -1289,23 +1458,37 @@ struct wc_swallow_the_semicolon
 
 struct km_sha_hmac_node {
     struct Hmac wc_hmac;
-    /* linkage for the tfm-owned cleanup list */
+    /* linkage for the tfm-owned desc_list or export_list */
     struct list_head desc_ent;
     word64 desc_id;
+    /* desc_list only: nonzero while a desc call uses wc_hmac outside
+     * desc_list_lock
+     */
+    unsigned int busy;
 };
 struct km_sha_hmac_state {
     /* HASH_MAX_DESCSIZE is 368, but sizeof(struct Hmac) is 832, so the working
-     * Hmac lives in a heap node hung off the desc and tracked on the tfm
-     * cleanup list for garbage collection at .exit_tfm. */
-    struct km_sha_hmac_node *node;
+     * Hmac lives in a heap node on the tfm's desc_list, and the desc holds only
+     * a handle to it.  The handle is matched by value against desc_list and
+     * never dereferenced: the kernel can free a desc without calling .final,
+     * or hand us one whose ctx is stale or uninitialized, and its node can be
+     * evicted while the desc is idle.
+     */
+    word64 tfm_cookie;
+    word64 desc_id;
 };
 struct km_sha_hmac_pstate {
     /* keyed, pristine Hmac, deep-copied into each desc's node at .init */
     struct Hmac wc_hmac;
-    /* desc_list_lock guards BOTH lists below. */
+    /* desc_list_lock guards BOTH lists below, their lengths, cur_desc_id, and
+     * the busy count of every node on desc_list.
+     */
     wolfSSL_Mutex desc_list_lock;
-    /* cleanup list of live/abandoned desc working nodes (abandonment GC) */
+    /* working nodes of live and abandoned descs, most recently used first,
+     * bounded by WC_LINUXKM_HASH_DESC_LIST_MAX
+     */
     struct list_head desc_list;
+    unsigned int desc_list_len;
     /* bounded ring of .export snapshots; import validates handles against it */
     struct list_head export_list;
     unsigned int export_list_len;
@@ -1384,52 +1567,149 @@ WC_MAYBE_UNUSED static int linuxkm_hmac_setkey_common(struct crypto_shash *tfm, 
         return -EINVAL;
 }
 
-WC_MAYBE_UNUSED static int km_hmac_alloc_tstate(struct shash_desc *desc) {
-    struct km_sha_hmac_pstate *p_ctx =
-        (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
-    struct km_sha_hmac_state *s_ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
-    s_ctx->node = (struct km_sha_hmac_node *)malloc(sizeof(struct km_sha_hmac_node));
-    if (! s_ctx->node)
-        return -ENOMEM;
-    /* Must zero to assure the Hmac object is safe to pass to wc_HmacFree() even
-     * if init fails.
-     */
-    XMEMSET(s_ctx->node, 0, sizeof *s_ctx->node);
-
-    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0) {
-        free(s_ctx->node);
-        s_ctx->node = NULL;
-        return -EINVAL;
-    }
-    s_ctx->node->desc_id = p_ctx->cur_desc_id++;
-    list_add(&s_ctx->node->desc_ent, &p_ctx->desc_list);
-    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
-
-    return 0;
-}
-
-WC_MAYBE_UNUSED static void km_hmac_free_tstate(struct shash_desc *desc) {
-    struct km_sha_hmac_pstate *p_ctx =
-        (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
-    struct km_sha_hmac_state *s_ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
-
-    if (s_ctx->node == NULL)
-        return;
-
-    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0)
-        return;
-    list_del(&s_ctx->node->desc_ent);
-    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
-
+WC_MAYBE_UNUSED static void km_hmac_free_node(struct km_sha_hmac_node *node) {
     /* wc_HmacFree is NOT a no-op: a wc_HmacCopy'd node can own inner/outer hash
      * heap (e.g. SMALL_STACK_CACHE W buffers), so it must run before free().
      */
-    wc_HmacFree(&s_ctx->node->wc_hmac);
+    wc_HmacFree(&node->wc_hmac);
 #if defined(HAVE_FIPS) && FIPS_VERSION3_LT(6,0,0)
-    ForceZero(s_ctx->node, sizeof *s_ctx->node);
+    ForceZero(node, sizeof *node);
 #endif
-    free(s_ctx->node);
-    s_ctx->node = NULL;
+    free(node);
+}
+
+/* Caller holds desc_list_lock. */
+WC_MAYBE_UNUSED static struct km_sha_hmac_node *km_hmac_find_tstate_locked(
+    struct km_sha_hmac_pstate *p_ctx, const struct km_sha_hmac_state *s_ctx)
+{
+    struct km_sha_hmac_node *node_i;
+
+    if (s_ctx->tfm_cookie != p_ctx->tfm_cookie)
+        return NULL;
+    list_for_each_entry(node_i, &p_ctx->desc_list, desc_ent) {
+        if (node_i->desc_id == s_ctx->desc_id)
+            return node_i;
+    }
+    return NULL;
+}
+
+/* Makes newnode (not yet on desc_list) the desc's working node, taking
+ * ownership of it.  The desc's prior node (if its handle still names one) and,
+ * at WC_LINUXKM_HASH_DESC_LIST_MAX, the least recently used idle nodes are
+ * unlinked onto reap.  Caller holds desc_list_lock, and passes reap to
+ * km_hmac_free_reaped() after unlocking.
+ */
+WC_MAYBE_UNUSED static void km_hmac_install_tstate_locked(
+    struct km_sha_hmac_pstate *p_ctx, struct km_sha_hmac_state *s_ctx,
+    struct km_sha_hmac_node *newnode, struct list_head *reap)
+{
+    struct km_sha_hmac_node *node_i;
+    struct list_head *pos;
+
+    node_i = km_hmac_find_tstate_locked(p_ctx, s_ctx);
+    if ((node_i != NULL) && (node_i->busy == 0)) {
+        list_del(&node_i->desc_ent);
+        --p_ctx->desc_list_len;
+        list_add(&node_i->desc_ent, reap);
+    }
+
+    pos = p_ctx->desc_list.prev;
+    while ((p_ctx->desc_list_len >= WC_LINUXKM_HASH_DESC_LIST_MAX) &&
+           (pos != &p_ctx->desc_list))
+    {
+        node_i = list_entry(pos, struct km_sha_hmac_node, desc_ent);
+        pos = pos->prev;
+        if (node_i->busy != 0)
+            continue;
+        list_del(&node_i->desc_ent);
+        --p_ctx->desc_list_len;
+        list_add(&node_i->desc_ent, reap);
+    }
+
+    newnode->busy = 0;
+    newnode->desc_id = p_ctx->cur_desc_id++;
+    list_add(&newnode->desc_ent, &p_ctx->desc_list);
+    ++p_ctx->desc_list_len;
+    s_ctx->tfm_cookie = p_ctx->tfm_cookie;
+    s_ctx->desc_id = newnode->desc_id;
+}
+
+WC_MAYBE_UNUSED static void km_hmac_free_reaped(struct list_head *reap) {
+    struct km_sha_hmac_node *node_i;
+    struct km_sha_hmac_node *next_ent;
+
+    list_for_each_entry_safe(node_i, next_ent, reap, desc_ent) {
+        list_del(&node_i->desc_ent);
+        km_hmac_free_node(node_i);
+    }
+}
+
+/* Looks up the desc's working node, marks it most recently used, and holds it
+ * against eviction until km_hmac_put_tstate().  NULL if the desc has none
+ * (never initialized, finalized, or evicted).
+ */
+WC_MAYBE_UNUSED static struct km_sha_hmac_node *km_hmac_get_tstate(
+    struct shash_desc *desc)
+{
+    struct km_sha_hmac_pstate *p_ctx =
+        (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
+    struct km_sha_hmac_node *node;
+
+    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0)
+        return NULL;
+    node = km_hmac_find_tstate_locked(
+        p_ctx, (const struct km_sha_hmac_state *)shash_desc_ctx(desc));
+    if (node != NULL) {
+        ++node->busy;
+        list_del(&node->desc_ent);
+        list_add(&node->desc_ent, &p_ctx->desc_list);
+    }
+    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
+
+    return node;
+}
+
+WC_MAYBE_UNUSED static void km_hmac_put_tstate(struct shash_desc *desc,
+                                               struct km_sha_hmac_node *node)
+{
+    struct km_sha_hmac_pstate *p_ctx =
+        (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
+
+    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0)
+        return;
+    --node->busy;
+    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
+}
+
+/* Unlinks the desc's working node for exclusive use by the caller, who must
+ * free it with km_hmac_free_node().
+ */
+WC_MAYBE_UNUSED static struct km_sha_hmac_node *km_hmac_take_tstate(
+    struct shash_desc *desc)
+{
+    struct km_sha_hmac_pstate *p_ctx =
+        (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
+    struct km_sha_hmac_node *node;
+
+    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0)
+        return NULL;
+    node = km_hmac_find_tstate_locked(
+        p_ctx, (const struct km_sha_hmac_state *)shash_desc_ctx(desc));
+    if ((node != NULL) && (node->busy != 0))
+        node = NULL;
+    if (node != NULL) {
+        list_del(&node->desc_ent);
+        --p_ctx->desc_list_len;
+    }
+    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
+
+    return node;
+}
+
+WC_MAYBE_UNUSED static void km_hmac_free_tstate(struct shash_desc *desc) {
+    struct km_sha_hmac_node *node = km_hmac_take_tstate(desc);
+    if (node != NULL)
+        km_hmac_free_node(node);
 }
 
 WC_MAYBE_UNUSED static int km_hmac_init_tfm(struct crypto_shash *tfm)
@@ -1443,6 +1723,7 @@ WC_MAYBE_UNUSED static int km_hmac_init_tfm(struct crypto_shash *tfm)
         return -EINVAL;
     }
     INIT_LIST_HEAD(&p_ctx->desc_list);
+    p_ctx->desc_list_len = 0;
     INIT_LIST_HEAD(&p_ctx->export_list);
     p_ctx->export_list_len = 0;
     p_ctx->cur_desc_id = 0;
@@ -1487,16 +1768,31 @@ WC_MAYBE_UNUSED static int km_hmac_init(struct shash_desc *desc) {
     int ret;
     struct km_sha_hmac_state *s_ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
     struct km_sha_hmac_pstate *p_ctx = (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
+    struct km_sha_hmac_node *newnode;
+    struct list_head reap;
 
-    ret = km_hmac_alloc_tstate(desc);
-    if (ret)
-        return ret;
+    newnode = (struct km_sha_hmac_node *)malloc(sizeof(struct km_sha_hmac_node));
+    if (! newnode)
+        return -ENOMEM;
+    /* Must zero to assure the Hmac object is safe to pass to wc_HmacFree() even
+     * if the copy fails.
+     */
+    XMEMSET(newnode, 0, sizeof *newnode);
 
-    ret = wc_HmacCopy(&p_ctx->wc_hmac, &s_ctx->node->wc_hmac);
+    ret = wc_HmacCopy(&p_ctx->wc_hmac, &newnode->wc_hmac);
     if (ret != 0) {
-        km_hmac_free_tstate(desc);
+        km_hmac_free_node(newnode);
         return -EINVAL;
     }
+
+    if (wc_LockMutex(&p_ctx->desc_list_lock) != 0) {
+        km_hmac_free_node(newnode);
+        return -EINVAL;
+    }
+    INIT_LIST_HEAD(&reap);
+    km_hmac_install_tstate_locked(p_ctx, s_ctx, newnode, &reap);
+    (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
+    km_hmac_free_reaped(&reap);
 
     return 0;
 }
@@ -1504,9 +1800,13 @@ WC_MAYBE_UNUSED static int km_hmac_init(struct shash_desc *desc) {
 WC_MAYBE_UNUSED static int km_hmac_update(struct shash_desc *desc, const u8 *data,
                           unsigned int len)
 {
-    struct km_sha_hmac_state *ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
+    struct km_sha_hmac_node *node = km_hmac_get_tstate(desc);
+    int ret;
 
-    int ret = wc_HmacUpdate(&ctx->node->wc_hmac, data, len);
+    if (node == NULL)
+        return -EINVAL;
+    ret = wc_HmacUpdate(&node->wc_hmac, data, len);
+    km_hmac_put_tstate(desc, node);
 
     if (ret == 0)
         return 0;
@@ -1517,11 +1817,13 @@ WC_MAYBE_UNUSED static int km_hmac_update(struct shash_desc *desc, const u8 *dat
 }
 
 WC_MAYBE_UNUSED static int km_hmac_final(struct shash_desc *desc, u8 *out) {
-    struct km_sha_hmac_state *ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
+    struct km_sha_hmac_node *node = km_hmac_take_tstate(desc);
+    int ret;
 
-    int ret = wc_HmacFinal(&ctx->node->wc_hmac, out);
-
-    km_hmac_free_tstate(desc);
+    if (node == NULL)
+        return -EINVAL;
+    ret = wc_HmacFinal(&node->wc_hmac, out);
+    km_hmac_free_node(node);
 
     if (ret == 0)
         return 0;
@@ -1532,16 +1834,20 @@ WC_MAYBE_UNUSED static int km_hmac_final(struct shash_desc *desc, u8 *out) {
 WC_MAYBE_UNUSED static int km_hmac_finup(struct shash_desc *desc, const u8 *data,
                       unsigned int len, u8 *out)
 {
-    struct km_sha_hmac_state *ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
+    struct km_sha_hmac_node *node = km_hmac_take_tstate(desc);
+    int ret;
 
-    int ret = wc_HmacUpdate(&ctx->node->wc_hmac, data, len);
-
-    if (ret != 0) {
-        km_hmac_free_tstate(desc);
+    if (node == NULL)
         return -EINVAL;
-    }
+    ret = wc_HmacUpdate(&node->wc_hmac, data, len);
+    if (ret == 0)
+        ret = wc_HmacFinal(&node->wc_hmac, out);
+    km_hmac_free_node(node);
 
-    return km_hmac_final(desc, out);
+    if (ret == 0)
+        return 0;
+    else
+        return -EINVAL;
 }
 
 WC_MAYBE_UNUSED static int km_hmac_digest(struct shash_desc *desc, const u8 *data,
@@ -1587,24 +1893,27 @@ WC_MAYBE_UNUSED static int km_hmac_digest(struct shash_desc *desc, const u8 *dat
 WC_MAYBE_UNUSED static int km_hmac_export(struct shash_desc *desc, void *out)
 {
     struct km_sha_hmac_pstate *p_ctx = (struct km_sha_hmac_pstate *)crypto_shash_ctx(desc->tfm);
-    struct km_sha_hmac_state *s_ctx = (struct km_sha_hmac_state *)shash_desc_ctx(desc);
     struct km_sha_hmac_export_state *blob = (struct km_sha_hmac_export_state *)out;
+    struct km_sha_hmac_node *node;
     struct km_sha_hmac_node *snapshot;
     struct km_sha_hmac_node *evicted = NULL;
     int ret;
     typeof(snapshot->desc_id) snapshot_desc_id;
 
-    if (s_ctx->node == NULL)
-        return -EINVAL;
-
     /* Snapshot the live state into a fresh node.  Allocate and deep-copy
-     * OUTSIDE the lock -- wc_HmacCopy may allocate inner-hash heap.  Copying
-     * from this desc's own working node needs no lock (a desc is not used
-     * concurrently); the lock protects the lists, not the nodes. */
+     * OUTSIDE the lock -- wc_HmacCopy may allocate inner-hash heap.  The
+     * desc's working node is held against eviction while it is copied; the
+     * lock protects the lists, not the nodes. */
+    node = km_hmac_get_tstate(desc);
+    if (node == NULL)
+        return -EINVAL;
     snapshot = (struct km_sha_hmac_node *)malloc(sizeof(struct km_sha_hmac_node));
-    if (! snapshot)
+    if (! snapshot) {
+        km_hmac_put_tstate(desc, node);
         return -ENOMEM;
-    ret = wc_HmacCopy(&s_ctx->node->wc_hmac, &snapshot->wc_hmac);
+    }
+    ret = wc_HmacCopy(&node->wc_hmac, &snapshot->wc_hmac);
+    km_hmac_put_tstate(desc, node);
     if (ret != 0) {
         ForceZero(snapshot, sizeof(*snapshot));
         free(snapshot);
@@ -1662,6 +1971,7 @@ WC_MAYBE_UNUSED static int km_hmac_import(struct shash_desc *desc, const void *i
     const struct km_sha_hmac_export_state *blob = (const struct km_sha_hmac_export_state *)in;
     struct km_sha_hmac_node *node_i;
     struct km_sha_hmac_node *newnode;
+    struct list_head reap;
     int found = 0;
     int ret;
 
@@ -1712,14 +2022,14 @@ WC_MAYBE_UNUSED static int km_hmac_import(struct shash_desc *desc, const void *i
         free(newnode);
         return -EINVAL;
     }
-    /* Publish: link the working node onto desc_list and into the desc ctx,
-     * overwriting any poisoned prior pointer without reading it.  A real prior
-     * node orphans onto desc_list and is reaped at exit_tfm.
+    /* Publish: link the working node onto desc_list and into the desc ctx.  A
+     * poisoned prior handle matches nothing and is overwritten; a real prior
+     * node is unlinked here and freed below.
      */
-    newnode->desc_id = p_ctx->cur_desc_id++;
-    list_add(&newnode->desc_ent, &p_ctx->desc_list);
-    s_ctx->node = newnode;
+    INIT_LIST_HEAD(&reap);
+    km_hmac_install_tstate_locked(p_ctx, s_ctx, newnode, &reap);
     (void)wc_UnLockMutex(&p_ctx->desc_list_lock);
+    km_hmac_free_reaped(&reap);
 
     return 0;
 }
