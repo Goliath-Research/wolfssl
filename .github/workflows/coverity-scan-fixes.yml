@@ -7,6 +7,9 @@ on:
     - cron: '0 0 * * 0'
     - cron: '0 12 * * 0'
 
+permissions:
+  contents: read
+
 jobs:
   coverity:
     if: github.repository_owner == 'wolfssl'
@@ -44,7 +47,7 @@ jobs:
         email_len=${#email_var}
         echo "$email_len"
 
-    - uses: vapier/coverity-scan-action@v1
+    - uses: vapier/coverity-scan-action@8fe7b0af23cbbd4eced5f63dcd2384640eaa5d49 # v1.10.0
       with:
         build_language: 'cxx'
         project: "wolfSSL/wolfssl"
