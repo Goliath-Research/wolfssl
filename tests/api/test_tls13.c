@@ -5220,7 +5220,8 @@ int test_tls13_remove_session_return(void)
     defined(HAVE_SESSION_TICKET) && defined(WOLFSSL_TICKET_HAVE_ID) && \
     !defined(NO_SESSION_CACHE) && defined(HAVE_EXT_CACHE)
 /* Thin external cache: only tracks rem_calls to verify that
- * wolfSSL_SSL_CTX_remove_session counts the callback as "found". */
+ * wolfSSL_SSL_CTX_remove_session still notifies the callback but does not
+ * count it as "found". */
 static int test_0rtt_ext_only_rem_calls;
 
 static int test_0rtt_ext_only_new_cb(WOLFSSL* ssl, WOLFSSL_SESSION* s)
@@ -5245,9 +5246,10 @@ static void test_0rtt_ext_only_rem_cb(WOLFSSL_CTX* ctx, WOLFSSL_SESSION* s)
 #endif
 
 /* Verify that when the internal cache is off but an external cache callback
- * is registered, wolfSSL_SSL_CTX_remove_session returns 1 (the ext callback
- * fired, so we assume the session was present). Fails without the fix
- * because the old code only set found=1 on an internal-cache hit. */
+ * is registered, wolfSSL_SSL_CTX_remove_session invokes the callback and
+ * returns 0. The callback cannot report whether the external cache held the
+ * session, so it must not satisfy the 0-RTT single-use check (matches
+ * OpenSSL, whose anti-replay relies on the internal cache). */
 int test_tls13_0rtt_ext_cache_eviction(void)
 {
     EXPECT_DECLS;
@@ -5282,10 +5284,10 @@ int test_tls13_0rtt_ext_cache_eviction(void)
     ExpectIntEQ(wolfSSL_read(ssl_c, buf, sizeof(buf)), -1);
     ExpectIntEQ(wolfSSL_get_error(ssl_c, -1), WOLFSSL_ERROR_WANT_READ);
 
-    /* remove_session on an ext-cache-only server: rem_cb should fire and
-     * the function should return 1 (assumes the ext cache had it). */
+    /* remove_session on an ext-cache-only server: rem_cb should fire but
+     * the function returns 0 since no internal cache entry was consumed. */
     ExpectNotNull(sess = wolfSSL_get1_session(ssl_s));
-    ExpectIntEQ(wolfSSL_SSL_CTX_remove_session(ctx_s, sess), 1);
+    ExpectIntEQ(wolfSSL_SSL_CTX_remove_session(ctx_s, sess), 0);
     ExpectIntGT(test_0rtt_ext_only_rem_calls, 0);
 
     wolfSSL_SESSION_free(sess);
