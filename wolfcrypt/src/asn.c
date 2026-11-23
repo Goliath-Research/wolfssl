@@ -24119,6 +24119,21 @@ static int GeneratePreTBSBuffer(DecodedCert* cert, byte** derOut)
 }
 #endif /* WOLFSSL_DUAL_ALG_CERTS */
 
+#if defined(HAVE_RPK)
+/* A Raw Public Key (RFC 7250) has no issuer and no signature, so no CA can
+ * vouch for it. When verification is requested, only accept one if the caller
+ * authenticates the key itself (rpkTrustOutOfBand), e.g. against a pin. */
+static int ParseCertRelativeRpk(DecodedCert* cert, int verify, int ret)
+{
+    if ((ret == 0) && (verify != NO_VERIFY) && !cert->rpkTrustOutOfBand) {
+        WOLFSSL_MSG("Raw Public Key cannot be verified against a CA");
+        ret = ASN_NO_SIGNER_E;
+        WOLFSSL_ERROR_VERBOSE(ret);
+    }
+    return ret;
+}
+#endif /* HAVE_RPK */
+
 int ParseCertRelative(DecodedCert* cert, int type, int verify, void* cm,
                       Signer *extraCAList)
 {
@@ -24168,7 +24183,7 @@ int ParseCertRelative(DecodedCert* cert, int type, int verify, void* cm,
         WOLFSSL_MSG("Parsed Past Key");
 #if defined(HAVE_RPK)
         if (cert->isRPK) {
-            return ret;
+            return ParseCertRelativeRpk(cert, verify, ret);
         }
 #endif /* HAVE_RPK */
 
@@ -24418,7 +24433,7 @@ int ParseCertRelative(DecodedCert* cert, int type, int verify, void* cm,
             }
 #if defined(HAVE_RPK)
             if (cert->isRPK) {
-                return ret;
+                return ParseCertRelativeRpk(cert, verify, ret);
             }
 #endif /* HAVE_RPK */
         }
