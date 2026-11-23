@@ -61,6 +61,8 @@ int test_tls13_0rtt_default_off(void);
 int test_tls13_0rtt_stateless_replay(void);
 int test_tls13_remove_session_return(void);
 int test_tls13_0rtt_ext_cache_eviction(void);
+int test_tls13_0rtt_captured_flight_single_use(void);
+int test_tls13_0rtt_captured_flight_notify_remove(void);
 int test_tls13_corrupted_finished(void);
 int test_tls13_certificate_verify_bad_sigalgo(void);
 int test_tls13_peerauth_failsafe(void);
@@ -143,6 +145,8 @@ int test_tls13_pha_status_request(void);
     TEST_DECL_GROUP("tls13", test_tls13_0rtt_stateless_replay), \
     TEST_DECL_GROUP("tls13", test_tls13_remove_session_return), \
     TEST_DECL_GROUP("tls13", test_tls13_0rtt_ext_cache_eviction), \
+    TEST_DECL_GROUP("tls13", test_tls13_0rtt_captured_flight_single_use), \
+    TEST_DECL_GROUP("tls13", test_tls13_0rtt_captured_flight_notify_remove), \
     TEST_DECL_GROUP("tls13", test_tls13_unknown_ext_rejected),  \
     TEST_DECL_GROUP("tls13", test_tls13_hrr_recognized_ext_downgrade), \
     TEST_DECL_GROUP("tls13", test_tls13_corrupted_finished),     \
