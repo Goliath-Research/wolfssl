@@ -1,0 +1,3 @@
+#ifndef FREERTOS_EVENT_GROUPS_H_
+#define FREERTOS_EVENT_GROUPS_H_
+#endif
