@@ -24,7 +24,10 @@ jobs:
 
       - name: Post Membrowse PR comment
         if: ${{ env.MEMBROWSE_API_KEY != '' }}
-        uses: membrowse/membrowse-action/comment-action@v1
+        # Pinned to a full commit SHA: this step holds MEMBROWSE_API_KEY and a
+        # token that can write PR comments, so a moved tag must not be able to
+        # swap the action out from under it. v1.2.9.
+        uses: membrowse/membrowse-action/comment-action@3f23ea562abaa6614855d6be5ec83b3cd1d274dd
         with:
           api_key: ${{ secrets.MEMBROWSE_API_KEY }}
           commit: ${{ github.event.workflow_run.head_sha }}
