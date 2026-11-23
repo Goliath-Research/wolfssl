@@ -5027,6 +5027,252 @@ int test_tls13_early_data_0rtt_replay(void)
 }
 #endif
 
+#if defined(WOLFSSL_TLS13) && defined(WOLFSSL_EARLY_DATA) && \
+    !defined(NO_PSK) && !defined(HAVE_SESSION_TICKET) && \
+    defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && \
+    defined(HAVE_SUPPORTED_CURVES) && \
+    !defined(NO_WOLFSSL_CLIENT) && !defined(NO_WOLFSSL_SERVER)
+/* Read early data, retrying only while the memio peer cannot write or read.
+ * *leaked is set when buf receives the captured payload. The caller passes a
+ * buffer filled with 0xA5; a refusal must leave that filler in place. */
+static int test_tls13_extern_psk_read_early(WOLFSSL* ssl, char* buf, int bufLen,
+    int* got, const char* payload, int payloadLen, int* leaked)
+{
+    int ret = 0;
+    int guard = 8;
+
+    *got = 0;
+    *leaked = 0;
+    XMEMSET(buf, 0xA5, (size_t)bufLen);
+    do {
+        int n = 0;
+        int err = 0;
+
+        ret = wolfSSL_read_early_data(ssl, buf, bufLen, &n);
+        if (n > 0) {
+            int off;
+            *got = n;
+            for (off = 0; off + payloadLen <= n; off++) {
+                if (XMEMCMP(buf + off, payload, (size_t)payloadLen) == 0)
+                    *leaked = 1;
+            }
+        }
+        if (ret != WC_NO_ERR_TRACE(WOLFSSL_FATAL_ERROR))
+            break;
+        err = wolfSSL_get_error(ssl, ret);
+        if (err != WC_NO_ERR_TRACE(WOLFSSL_ERROR_WANT_WRITE) &&
+                err != WC_NO_ERR_TRACE(WOLFSSL_ERROR_WANT_READ))
+            break;
+    } while (guard-- > 0);
+    return ret;
+}
+
+static int test_tls13_extern_psk_write_early(WOLFSSL* ssl, const void* msg,
+    int msgLen, int* written)
+{
+    int ret;
+    int err = 0;
+    int guard = 8;
+
+    *written = 0;
+    do {
+        ret = wolfSSL_write_early_data(ssl, msg, msgLen, written);
+        if (ret != WC_NO_ERR_TRACE(WOLFSSL_FATAL_ERROR))
+            break;
+        err = wolfSSL_get_error(ssl, ret);
+    } while (guard-- > 0 &&
+             err == WC_NO_ERR_TRACE(WOLFSSL_ERROR_WANT_WRITE));
+    return ret;
+}
+
+static void test_tls13_extern_psk_save_flight(const struct test_memio_ctx* ctx,
+    byte* flight, int* flightLen, int* msgSizes, int* msgCount)
+{
+    *flightLen = ctx->s_len;
+    *msgCount = ctx->s_msg_count;
+    if (*flightLen > 0)
+        XMEMCPY(flight, ctx->s_buff, (size_t)*flightLen);
+    if (*msgCount > 0) {
+        XMEMCPY(msgSizes, ctx->s_msg_sizes,
+            (size_t)*msgCount * sizeof(msgSizes[0]));
+    }
+}
+
+static void test_tls13_extern_psk_restore_flight(struct test_memio_ctx* ctx,
+    const byte* flight, int flightLen, const int* msgSizes, int msgCount)
+{
+    test_memio_clear_buffer(ctx, 1);
+    test_memio_clear_buffer(ctx, 0);
+    if (flightLen > 0)
+        XMEMCPY(ctx->s_buff, flight, (size_t)flightLen);
+    ctx->s_len = flightLen;
+    ctx->s_msg_pos = 0;
+    ctx->s_msg_count = msgCount;
+    if (msgCount > 0) {
+        XMEMCPY(ctx->s_msg_sizes, msgSizes,
+            (size_t)msgCount * sizeof(msgSizes[0]));
+    }
+}
+
+static WOLFSSL* test_tls13_extern_psk_new_server(WOLFSSL_CTX* ctx,
+    struct test_memio_ctx* io)
+{
+    WOLFSSL* ssl = wolfSSL_new(ctx);
+    if (ssl == NULL)
+        return NULL;
+    wolfSSL_SetIOReadCtx(ssl, io);
+    wolfSSL_SetIOWriteCtx(ssl, io);
+    wolfSSL_set_psk_server_callback(ssl, test_tls13_fnp_server_cb);
+    (void)wolfSSL_set_max_early_data(ssl, 128);
+    return ssl;
+}
+#endif /* external-PSK early data, no session tickets */
+
+/* External PSK, session tickets not built: the 0-RTT single-use eviction in
+ * CheckPreSharedKeys is compiled out. A second connection on the same CTX
+ * must not be given the plaintext of a captured early-data flight, including
+ * when that replay is offered before the original handshake finishes and
+ * again after a different flight has been accepted. Fails while a matching
+ * PSK identity alone is enough to decrypt early data. */
+int test_tls13_extern_psk_early_data_replay(void)
+{
+    EXPECT_DECLS;
+#if defined(WOLFSSL_TLS13) && defined(WOLFSSL_EARLY_DATA) && \
+    !defined(NO_PSK) && !defined(HAVE_SESSION_TICKET) && \
+    defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && \
+    defined(HAVE_SUPPORTED_CURVES) && \
+    !defined(NO_WOLFSSL_CLIENT) && !defined(NO_WOLFSSL_SERVER)
+    struct test_memio_ctx test_ctx;
+    WOLFSSL_CTX *ctx_c = NULL, *ctx_s = NULL;
+    WOLFSSL *ssl_c = NULL, *ssl_s = NULL, *ssl_s2 = NULL;
+    const char flightA[] = "early-flight-a";
+    const char flightB[] = "early-flight-b";
+    char earlyBuf[64];
+    byte* capturedA = NULL;
+    byte* capturedB = NULL;
+    int capturedALen = 0;
+    int capturedBLen = 0;
+    int capturedAMsgs[TEST_MEMIO_MAX_MSGS];
+    int capturedBMsgs[TEST_MEMIO_MAX_MSGS];
+    int capturedACount = 0;
+    int capturedBCount = 0;
+    int written = 0;
+    int got = 0;
+    int leaked = 0;
+
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    XMEMSET(capturedAMsgs, 0, sizeof(capturedAMsgs));
+    XMEMSET(capturedBMsgs, 0, sizeof(capturedBMsgs));
+    ExpectNotNull(capturedA = (byte*)XMALLOC(TEST_MEMIO_BUF_SZ, NULL,
+        DYNAMIC_TYPE_TMP_BUFFER));
+    ExpectNotNull(capturedB = (byte*)XMALLOC(TEST_MEMIO_BUF_SZ, NULL,
+        DYNAMIC_TYPE_TMP_BUFFER));
+    if (capturedA == NULL || capturedB == NULL) {
+        XFREE(capturedA, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        XFREE(capturedB, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        return EXPECT_RESULT();
+    }
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+                    wolfTLSv1_3_client_method, wolfTLSv1_3_server_method),
+                0);
+    wolfSSL_CTX_set_psk_client_callback(ctx_c, test_tls13_fnp_client_cb);
+    wolfSSL_CTX_set_psk_server_callback(ctx_s, test_tls13_fnp_server_cb);
+    wolfSSL_set_verify(ssl_c, WOLFSSL_VERIFY_NONE, NULL);
+    wolfSSL_set_psk_client_callback(ssl_c, test_tls13_fnp_client_cb);
+    wolfSSL_set_psk_server_callback(ssl_s, test_tls13_fnp_server_cb);
+    ExpectIntGE(wolfSSL_CTX_set_max_early_data(ctx_s, 128), 0);
+    ExpectIntGE(wolfSSL_set_max_early_data(ssl_s, 128), 0);
+
+    /* Legitimate client. Capture the ClientHello and early-data records
+     * before the server consumes them. */
+    ExpectIntEQ(test_tls13_extern_psk_write_early(ssl_c, flightA,
+                    (int)sizeof(flightA), &written),
+                (int)sizeof(flightA));
+    ExpectIntEQ(written, (int)sizeof(flightA));
+    test_tls13_extern_psk_save_flight(&test_ctx, capturedA, &capturedALen,
+        capturedAMsgs, &capturedACount);
+    ExpectIntGT(capturedALen, 0);
+    ExpectIntGT(capturedACount, 0);
+
+    /* First delivery is the application's opt-in 0-RTT read. */
+    (void)test_tls13_extern_psk_read_early(ssl_s, earlyBuf, (int)sizeof(earlyBuf),
+        &got, flightA, (int)sizeof(flightA), &leaked);
+    ExpectIntEQ(leaked, 1);
+    ExpectIntEQ(got, (int)sizeof(flightA));
+
+    /* Replay that flight on a new connection sharing the server CTX, while
+     * the original handshake is still unfinished. */
+    test_tls13_extern_psk_restore_flight(&test_ctx, capturedA, capturedALen,
+        capturedAMsgs, capturedACount);
+    ExpectNotNull(ssl_s2 = test_tls13_extern_psk_new_server(ctx_s, &test_ctx));
+    (void)test_tls13_extern_psk_read_early(ssl_s2, earlyBuf,
+        (int)sizeof(earlyBuf), &got, flightA, (int)sizeof(flightA), &leaked);
+    ExpectIntEQ(leaked, 0);
+    ExpectIntEQ(got, 0);
+    /* Refusal must not have copied the payload into the caller's buffer. */
+    ExpectIntEQ(earlyBuf[0], (char)0xA5);
+
+    wolfSSL_free(ssl_s2);
+    ssl_s2 = NULL;
+    wolfSSL_free(ssl_c);
+    ssl_c = NULL;
+    wolfSSL_free(ssl_s);
+    ssl_s = NULL;
+
+    /* A different early-data flight is its own use. Snapshot it before the
+     * server reads, accept it once, then replay both flights. */
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+                    wolfTLSv1_3_client_method, wolfTLSv1_3_server_method),
+                0);
+    wolfSSL_set_verify(ssl_c, WOLFSSL_VERIFY_NONE, NULL);
+    wolfSSL_set_psk_client_callback(ssl_c, test_tls13_fnp_client_cb);
+    wolfSSL_set_psk_server_callback(ssl_s, test_tls13_fnp_server_cb);
+    ExpectIntGE(wolfSSL_set_max_early_data(ssl_s, 128), 0);
+    ExpectIntEQ(test_tls13_extern_psk_write_early(ssl_c, flightB,
+                    (int)sizeof(flightB), &written),
+                (int)sizeof(flightB));
+    test_tls13_extern_psk_save_flight(&test_ctx, capturedB, &capturedBLen,
+        capturedBMsgs, &capturedBCount);
+    ExpectIntGT(capturedBLen, 0);
+    (void)test_tls13_extern_psk_read_early(ssl_s, earlyBuf, (int)sizeof(earlyBuf),
+        &got, flightB, (int)sizeof(flightB), &leaked);
+    ExpectIntEQ(leaked, 1);
+    ExpectIntEQ(got, (int)sizeof(flightB));
+
+    /* Accepting flight B must not authorize the earlier flight. */
+    test_tls13_extern_psk_restore_flight(&test_ctx, capturedA, capturedALen,
+        capturedAMsgs, capturedACount);
+    ExpectNotNull(ssl_s2 = test_tls13_extern_psk_new_server(ctx_s, &test_ctx));
+    (void)test_tls13_extern_psk_read_early(ssl_s2, earlyBuf,
+        (int)sizeof(earlyBuf), &got, flightA, (int)sizeof(flightA), &leaked);
+    ExpectIntEQ(leaked, 0);
+    ExpectIntEQ(got, 0);
+    ExpectIntEQ(earlyBuf[0], (char)0xA5);
+    wolfSSL_free(ssl_s2);
+    ssl_s2 = NULL;
+
+    /* Replay the flight that was just accepted. */
+    test_tls13_extern_psk_restore_flight(&test_ctx, capturedB, capturedBLen,
+        capturedBMsgs, capturedBCount);
+    ExpectNotNull(ssl_s2 = test_tls13_extern_psk_new_server(ctx_s, &test_ctx));
+    (void)test_tls13_extern_psk_read_early(ssl_s2, earlyBuf,
+        (int)sizeof(earlyBuf), &got, flightB, (int)sizeof(flightB), &leaked);
+    ExpectIntEQ(leaked, 0);
+    ExpectIntEQ(got, 0);
+    ExpectIntEQ(earlyBuf[0], (char)0xA5);
+
+    wolfSSL_free(ssl_s2);
+    wolfSSL_free(ssl_c);
+    wolfSSL_free(ssl_s);
+    wolfSSL_CTX_free(ctx_c);
+    wolfSSL_CTX_free(ctx_s);
+    XFREE(capturedA, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    XFREE(capturedB, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+#endif
+    return EXPECT_RESULT();
+}
+
 /* Verify that maxEarlyDataSz defaults to 0 (RFC 8446 E.5): a server that
  * has not called wolfSSL_set_max_early_data must not advertise 0-RTT in its
  * NewSessionTicket. Fails without the ctx->maxEarlyDataSz=0 default fix
