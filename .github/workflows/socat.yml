@@ -79,8 +79,20 @@ jobs:
       - name: untar build-dir
         run: tar -xf build-dir.tgz
 
+      # www.dest-unreach.org serves HTTPS with a self-signed certificate for
+      # another host name, so the archive is authenticated only by the pinned
+      # sha256 below. Each matrix socat_version needs an entry here.
       - name: Download socat
-        run: curl -O http://www.dest-unreach.org/socat/download/socat-${{ matrix.socat_version }}.tar.gz && tar xvf socat-${{ matrix.socat_version }}.tar.gz
+        run: |
+          case "${{ matrix.socat_version }}" in
+            1.8.0.0) sha256=6010f4f311e5ebe0e63c77f78613d264253680006ac8979f52b0711a9a231e82 ;;
+            1.8.0.3) sha256=a9f9eb6cfb9aa6b1b4b8fe260edbac3f2c743f294db1e362b932eb3feca37ba4 ;;
+            *) echo "::error::no pinned sha256 for socat ${{ matrix.socat_version }}"; exit 1 ;;
+          esac
+          archive=socat-${{ matrix.socat_version }}.tar.gz
+          curl -fsSL --retry 3 -o "$archive" http://www.dest-unreach.org/socat/download/socat-${{ matrix.socat_version }}.tar.gz
+          echo "$sha256  $archive" | sha256sum -c -
+          tar xvf "$archive"
 
       - name: Checkout OSP
         uses: actions/checkout@v5
