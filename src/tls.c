@@ -13543,6 +13543,16 @@ static int TLSX_ClientCertificateType_Parse(WOLFSSL* ssl, const byte* input,
     else if (msgType == server_hello || msgType == encrypted_extensions) {
         /* parse it in client side */
         if (length == 1) {
+            /* RFC 7250 4.2: the server must select a type the client
+             * offered. */
+            if (!IsCertTypeListed(*input,
+                        ssl->options.rpkState.sending_ClientCertTypeCnt,
+                        ssl->options.rpkState.sending_ClientCertTypes)) {
+                WOLFSSL_MSG("Client cert type selected was not offered");
+                SendAlert(ssl, alert_fatal, unsupported_certificate);
+                WOLFSSL_ERROR_VERBOSE(UNSUPPORTED_CERTIFICATE);
+                return UNSUPPORTED_CERTIFICATE;
+            }
             ssl->options.rpkState.received_ClientCertTypeCnt  = 1;
             ssl->options.rpkState.received_ClientCertTypes[0] = *input;
         }
@@ -13742,6 +13752,16 @@ static int TLSX_ServerCertificateType_Parse(WOLFSSL* ssl, const byte* input,
         /* in client side */
         if (length != 1)                     /* length slould be 1 */
             return BUFFER_E;
+
+        /* RFC 7250 4.2: the server must select a type the client offered. */
+        if (!IsCertTypeListed(*input,
+                    ssl->options.rpkState.sending_ServerCertTypeCnt,
+                    ssl->options.rpkState.sending_ServerCertTypes)) {
+            WOLFSSL_MSG("Server cert type selected was not offered");
+            SendAlert(ssl, alert_fatal, unsupported_certificate);
+            WOLFSSL_ERROR_VERBOSE(UNSUPPORTED_CERTIFICATE);
+            return UNSUPPORTED_CERTIFICATE;
+        }
 
         ssl->options.rpkState.received_ServerCertTypeCnt  = 1;
         ssl->options.rpkState.received_ServerCertTypes[0] = *input;
