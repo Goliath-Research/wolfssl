@@ -9,6 +9,9 @@ on:
         default: '100'
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   load-targets:
     # Only run from the wolfssl org to avoid burning forks' CI minutes
@@ -50,7 +53,7 @@ jobs:
           ghcr-debs-tag: ${{ matrix.ghcr_tag }}
 
       - name: Run Membrowse Onboard Action
-        uses: membrowse/membrowse-action/onboard-action@v1
+        uses: membrowse/membrowse-action/onboard-action@e12ea614e03dbd6cd42a5f2a6b6165df92428002 # v1.3.4
         with:
           target_name: ${{ matrix.target_name }}
           num_commits: ${{ github.event.inputs.num_commits }}

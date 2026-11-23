@@ -24,7 +24,7 @@ jobs:
 
       - name: Post Membrowse PR comment
         if: ${{ env.MEMBROWSE_API_KEY != '' }}
-        uses: membrowse/membrowse-action/comment-action@v1
+        uses: membrowse/membrowse-action/comment-action@e12ea614e03dbd6cd42a5f2a6b6165df92428002 # v1.3.4
         with:
           api_key: ${{ secrets.MEMBROWSE_API_KEY }}
           commit: ${{ github.event.workflow_run.head_sha }}

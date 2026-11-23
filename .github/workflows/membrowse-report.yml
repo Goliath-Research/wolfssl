@@ -44,7 +44,7 @@ jobs:
       - name: Detect binary-affecting changes
         id: filter
         if: github.event_name == 'pull_request' || github.event_name == 'push'
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           predicate-quantifier: every
           filters: |
@@ -97,7 +97,7 @@ jobs:
 
       - name: Run Membrowse PR Action
         id: analyze
-        uses: membrowse/membrowse-action@v1
+        uses: membrowse/membrowse-action@e12ea614e03dbd6cd42a5f2a6b6165df92428002 # v1.3.4
         with:
           target_name: ${{ matrix.target_name }}
           elf: ${{ needs.check-changes.outputs.needs_build == 'true' && matrix.elf || '' }}

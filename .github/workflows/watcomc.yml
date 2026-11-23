@@ -63,7 +63,7 @@ jobs:
     name: ${{ matrix.platform.title }} (${{ matrix.thread.id }} ${{ matrix.library.id }})
     steps:
       - name: Setup Open Watcom ${{ matrix.platform.owimage }}
-        uses: open-watcom/setup-watcom@v1
+        uses: open-watcom/setup-watcom@f0c24a936512429598af01e37fb4a96e8faece74 # v1
         with:
           version: ${{ matrix.platform.owimage }}
           # Currently fixed to a monthly build because of historical instability with daily releases.

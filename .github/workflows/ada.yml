@@ -20,7 +20,7 @@ jobs:
     - uses: actions/checkout@v5
 
     - name: Install alire
-      uses: alire-project/setup-alire@v5
+      uses: alire-project/setup-alire@8398015c233537c928d12293d46c0dcecb54434c # v5
       with:
         # The toolchain is downloaded from GitHub releases, so caching is not
         # beneficial relative to the cache space it uses.
