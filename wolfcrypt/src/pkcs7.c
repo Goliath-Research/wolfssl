@@ -6666,6 +6666,8 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                             pkcs7->stream->expected, &msg, idx)) != 0) {
             break;
         }
+        /* input before *idx is already counted in totalRd */
+        *tmpIdx = *idx;
 
         msgSz = (pkcs7->stream->length > 0)? pkcs7->stream->length:inSz;
 
@@ -6702,6 +6704,7 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 if (ret == WC_NO_ERR_TRACE(WC_PKCS7_WANT_READ_E)) {
                     break;  /* ask user more input */
                 }
+                *tmpIdx = *idx;
 
                 /* data available, continue processing */
                 continue;
@@ -6729,6 +6732,7 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 if (ret == WC_NO_ERR_TRACE(WC_PKCS7_WANT_READ_E)) {
                     break;  /* ask user more input */
                 }
+                *tmpIdx = *idx;
 
                 /* data available, continue processing trailing zeros */
                 for (i = 0; i < pkcs7->stream->expected; i++) {
@@ -6766,6 +6770,7 @@ static int wc_PKCS7_HandleOctetStrings(wc_PKCS7* pkcs7, byte* in, word32 inSz,
                 if (ret == WC_NO_ERR_TRACE(WC_PKCS7_WANT_READ_E)) {
                     break;
                 }
+                *tmpIdx = *idx;
 
                 /* handled OCTET STRINGs successfully */
                 ret = 0;
@@ -7148,6 +7153,8 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                            pkcs7->stream->expected, &pkiMsg, &idx)) != 0) {
                 break;
             }
+            /* input before idx is already counted in totalRd */
+            stateIdx = idx;
             degenerate = pkcs7->stream->degenerate;
 
             wc_PKCS7_StreamGetVar(pkcs7, &totalSz, 0, 0);
@@ -7510,26 +7517,18 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                 pkcs7->content   = pkcs7->contentDynamic;
             }
 
-            /* check if bundle has more elements or footer, if not, set content
-             * to pkcs7->content and hash to pkcs7->hash.
-             *
-             * NOTE: this check returns success whenever fewer than 6 bytes
-             * follow the content within the outer ContentInfo, which also
-             * accepts truncated bundles whose footer was cut short (e.g. a
-             * lone certificates [0] tag with no length). Distinguishing a
-             * legitimate degenerate end (such as an empty signerInfos SET
-             * "31 00") from truncated junk would require peeking at the
-             * remaining bytes or making stage 4's `expected` window smaller.
-             */
-            if (ret == 0 && pkcs7->stream->maxLen > 0 &&
-                    (pkcs7->stream->maxLen - pkcs7->stream->totalRd)
-                                                < ASN_TAG_SZ + MAX_LENGTH_SZ) {
-
-                ret = 0;
-                break;
-            }
-            /* expect data length to be enough to check set and seq of certs */
+            /* expect data length to be enough to check set and seq of certs.
+             * The certificates, crls and signerInfos that follow the content
+             * must always be parsed, even when only a few bytes remain (e.g.
+             * an empty signerInfos SET), so never ask for more than what is
+             * left of the bundle. */
             pkcs7->stream->expected = (ASN_TAG_SZ + MAX_LENGTH_SZ) * 2;
+            if (pkcs7->stream->maxLen > 0 &&
+                    pkcs7->stream->expected > (pkcs7->stream->maxLen -
+                                pkcs7->stream->totalRd) + pkcs7->stream->length) {
+                pkcs7->stream->expected = (pkcs7->stream->maxLen -
+                                pkcs7->stream->totalRd) + pkcs7->stream->length;
+            }
 
         #else
             /* Break out before content because it can be optional in degenerate
@@ -7656,6 +7655,8 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                             pkcs7->stream->expected, &pkiMsg2, &idx)) != 0) {
                 break;
             }
+            /* input before idx is already counted in totalRd */
+            stateIdx = idx;
 
         #ifdef ASN_BER_TO_DER
             if (pkcs7->derSz != 0)
@@ -7776,6 +7777,8 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
                             pkcs7->stream->expected, &pkiMsg2, &idx)) != 0) {
                 break;
             }
+            /* input before idx is already counted in totalRd */
+            stateIdx = idx;
             pkiMsg2Sz = (pkcs7->stream->length > 0)? pkcs7->stream->length:
                                                                         srcSz;
 
@@ -8092,7 +8095,27 @@ static int PKCS7_VerifySignedData(wc_PKCS7* pkcs7, const byte* hashBuf,
             #ifndef NO_PKCS7_STREAM
                 pkcs7->stream->degenerate = (degenerate != 0);
             #endif
+                if (pkcs7->noDegenerate == 1 && degenerate != 0) {
+                    WOLFSSL_MSG("Set to not allow degenerate cases");
+                    ret = PKCS7_NO_SIGNER_E;
+                }
             }
+
+        #ifndef NO_PKCS7_STREAM
+            /* signerInfos must fit in what is left of a definite length
+             * bundle, otherwise stage 7 would wait for input past its end */
+            if (ret == 0 && pkcs7->stream->indefLen == 0 &&
+                    pkcs7->stream->maxLen >= pkcs7->stream->totalRd) {
+                word32 rmn = (pkcs7->stream->maxLen - pkcs7->stream->totalRd) +
+                             pkcs7->stream->length;
+                word32 used = idx - stateIdx;
+
+                if (rmn >= used && (word32)length > rmn - used) {
+                    WOLFSSL_MSG("PKCS7 signerInfos exceeds bundle length");
+                    ret = ASN_PARSE_E;
+                }
+            }
+        #endif
 
             if (ret != 0)
                 break;
