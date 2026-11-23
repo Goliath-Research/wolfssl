@@ -5298,6 +5298,228 @@ int test_tls13_0rtt_ext_cache_eviction(void)
 }
 
 
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && \
+    defined(WOLFSSL_TLS13) && defined(WOLFSSL_EARLY_DATA) && \
+    defined(HAVE_SESSION_TICKET) && defined(WOLFSSL_TICKET_HAVE_ID) && \
+    !defined(NO_SESSION_CACHE) && !defined(WOLFSSL_NO_DEF_TICKET_ENC_CB)
+
+/* Notification-only session-remove callback. It does not store or delete a
+ * session. OpenSSL applications register this kind of callback to observe
+ * cache eviction; it is not an external single-use cache. */
+static int test_tls13_notify_rem_calls;
+
+static void test_tls13_notify_rem_cb(WOLFSSL_CTX* ctx, WOLFSSL_SESSION* sess)
+{
+    (void)ctx;
+    (void)sess;
+    test_tls13_notify_rem_calls++;
+}
+
+/* Client bytes waiting for the server (the 0-RTT flight). */
+struct test_tls13_flight {
+    int len;
+    int count;
+    int sizes[TEST_MEMIO_MAX_MSGS];
+    byte data[TEST_MEMIO_BUF_SZ];
+};
+
+static void test_tls13_save_server_inbox(const struct test_memio_ctx* ctx,
+    struct test_tls13_flight* flight)
+{
+    flight->len = ctx->s_len;
+    flight->count = ctx->s_msg_count;
+    XMEMCPY(flight->sizes, ctx->s_msg_sizes, sizeof(flight->sizes));
+    XMEMSET(flight->data, 0, sizeof(flight->data));
+    if (ctx->s_len > 0)
+        XMEMCPY(flight->data, ctx->s_buff, (size_t)ctx->s_len);
+}
+
+static void test_tls13_restore_server_inbox(struct test_memio_ctx* ctx,
+    const struct test_tls13_flight* flight)
+{
+    XMEMSET(ctx->s_buff, 0, sizeof(ctx->s_buff));
+    XMEMSET(ctx->s_msg_sizes, 0, sizeof(ctx->s_msg_sizes));
+    ctx->s_len = flight->len;
+    ctx->s_msg_count = flight->count;
+    ctx->s_msg_pos = 0;
+    if (flight->count > 0)
+        XMEMCPY(ctx->s_msg_sizes, flight->sizes,
+            sizeof(int) * (size_t)flight->count);
+    if (flight->len > 0)
+        XMEMCPY(ctx->s_buff, flight->data, (size_t)flight->len);
+    ctx->c_len = 0;
+    ctx->c_msg_count = 0;
+    ctx->c_msg_pos = 0;
+}
+
+/* Present one recorded 0-RTT flight to a fresh server on the same CTX.
+ * Returns the early-data plaintext length, or -1 when setup fails. */
+static int test_tls13_present_flight(struct test_memio_ctx* ctx,
+    WOLFSSL_CTX* ctx_s, const struct test_tls13_flight* flight,
+    char* out, int outSz)
+{
+    WOLFSSL* ssl_s = NULL;
+    int earlyRead = 0;
+    int setupRet;
+
+    test_tls13_restore_server_inbox(ctx, flight);
+    setupRet = test_memio_setup(ctx, NULL, &ctx_s, NULL, &ssl_s,
+        NULL, wolfTLSv1_3_server_method);
+    if (setupRet != 0 || ssl_s == NULL)
+        return -1;
+    if (wolfSSL_set_max_early_data(ssl_s, MAX_EARLY_DATA_SZ) < 0) {
+        wolfSSL_free(ssl_s);
+        return -1;
+    }
+    (void)test_tls13_early_data_read_until_write_ok(ssl_s, out, outSz,
+        &earlyRead);
+    wolfSSL_free(ssl_s);
+    return earlyRead;
+}
+
+/* Record one stateless 0-RTT flight, deliver it once, then feed those same
+ * bytes to two more servers that share the session cache. outFirst/outReplay
+ * receive the plaintext lengths. notifyCb registers the remove callback. */
+static int test_tls13_run_captured_flight(int notifyCb, int* outFirst,
+    int* outReplay, int* outReplayAgain, char* replayBuf, int replayBufSz)
+{
+    EXPECT_DECLS;
+    struct test_memio_ctx test_ctx;
+    struct test_tls13_flight flight;
+    WOLFSSL_CTX *ctx_c = NULL, *ctx_s = NULL;
+    WOLFSSL *ssl_c = NULL, *ssl_s = NULL;
+    WOLFSSL_SESSION *sess = NULL;
+    char buf[64];
+    const char earlyMsg[] = "replay-early-data";
+    char earlyBuf[sizeof(earlyMsg)];
+    int written = 0;
+    int earlyRead = 0;
+
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    XMEMSET(&flight, 0, sizeof(flight));
+    XMEMSET(earlyBuf, 0, sizeof(earlyBuf));
+    test_tls13_notify_rem_calls = 0;
+    *outFirst = -1;
+    *outReplay = -1;
+    *outReplayAgain = -1;
+
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+                    wolfTLSv1_3_client_method, wolfTLSv1_3_server_method),
+                0);
+    if (notifyCb)
+        wolfSSL_CTX_sess_set_remove_cb(ctx_s, test_tls13_notify_rem_cb);
+    /* Stateless tickets (do not set WOLFSSL_OP_NO_TICKET). */
+    ExpectIntGE(wolfSSL_CTX_set_max_early_data(ctx_s, MAX_EARLY_DATA_SZ), 0);
+    ExpectIntGE(wolfSSL_set_max_early_data(ssl_s, MAX_EARLY_DATA_SZ), 0);
+
+    ExpectIntEQ(test_memio_do_handshake(ssl_c, ssl_s, 10, NULL), 0);
+    ExpectIntEQ(wolfSSL_read(ssl_c, buf, sizeof(buf)), -1);
+    ExpectIntEQ(wolfSSL_get_error(ssl_c, -1), WOLFSSL_ERROR_WANT_READ);
+    ExpectNotNull(sess = wolfSSL_get1_session(ssl_c));
+    ExpectIntEQ(wolfSSL_SessionIsSetup(sess), 1);
+    /* Encrypted ticket, not a bare session id. */
+    ExpectIntGT(sess->ticketLen, ID_LEN);
+
+    wolfSSL_free(ssl_c); ssl_c = NULL;
+    wolfSSL_free(ssl_s); ssl_s = NULL;
+
+    XMEMSET(&test_ctx, 0, sizeof(test_ctx));
+    ExpectIntEQ(test_memio_setup(&test_ctx, &ctx_c, &ctx_s, &ssl_c, &ssl_s,
+                    wolfTLSv1_3_client_method, wolfTLSv1_3_server_method),
+                0);
+    ExpectIntGE(wolfSSL_set_max_early_data(ssl_s, MAX_EARLY_DATA_SZ), 0);
+    ExpectIntEQ(wolfSSL_set_session(ssl_c, sess), WOLFSSL_SUCCESS);
+    ExpectIntEQ(test_tls13_early_data_write_until_write_ok(ssl_c, earlyMsg,
+                    (int)sizeof(earlyMsg), &written),
+                (int)sizeof(earlyMsg));
+    ExpectIntEQ(written, (int)sizeof(earlyMsg));
+
+    /* The bytes now in the server inbox are the recorded flight. */
+    test_tls13_save_server_inbox(&test_ctx, &flight);
+    ExpectIntGT(flight.len, 0);
+    ExpectIntGT(flight.count, 0);
+
+    /* First delivery. Stop before the handshake continues into a new
+     * NewSessionTicket, which would put the same ticket id back in the cache. */
+    (void)test_tls13_early_data_read_until_write_ok(ssl_s, earlyBuf,
+        (int)sizeof(earlyBuf), &earlyRead);
+    *outFirst = earlyRead;
+    ExpectIntEQ(earlyRead, (int)sizeof(earlyMsg));
+    ExpectStrEQ(earlyMsg, earlyBuf);
+
+    wolfSSL_free(ssl_c); ssl_c = NULL;
+    wolfSSL_free(ssl_s); ssl_s = NULL;
+
+    /* Same bytes, new connection, same CTX and session cache. */
+    XMEMSET(replayBuf, 0, (size_t)replayBufSz);
+    *outReplay = test_tls13_present_flight(&test_ctx, ctx_s, &flight,
+        replayBuf, replayBufSz);
+    ExpectIntGE(*outReplay, 0);
+
+    XMEMSET(replayBuf, 0, (size_t)replayBufSz);
+    *outReplayAgain = test_tls13_present_flight(&test_ctx, ctx_s, &flight,
+        replayBuf, replayBufSz);
+    ExpectIntGE(*outReplayAgain, 0);
+
+    wolfSSL_SESSION_free(sess);
+    wolfSSL_CTX_free(ctx_c);
+    wolfSSL_CTX_free(ctx_s);
+    return EXPECT_RESULT();
+}
+#endif
+
+/* Without a remove callback, a second and third presentation of one recorded
+ * 0-RTT flight must not return the plaintext. The first presentation consumes
+ * the cache entry inside CheckPreSharedKeys. */
+int test_tls13_0rtt_captured_flight_single_use(void)
+{
+    EXPECT_DECLS;
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && \
+    defined(WOLFSSL_TLS13) && defined(WOLFSSL_EARLY_DATA) && \
+    defined(HAVE_SESSION_TICKET) && defined(WOLFSSL_TICKET_HAVE_ID) && \
+    !defined(NO_SESSION_CACHE) && !defined(WOLFSSL_NO_DEF_TICKET_ENC_CB)
+    int first = -1, replay = -1, replayAgain = -1;
+    char replayBuf[32];
+    const char earlyMsg[] = "replay-early-data";
+
+    ExpectIntEQ(test_tls13_run_captured_flight(0, &first, &replay,
+                    &replayAgain, replayBuf, (int)sizeof(replayBuf)),
+                TEST_SUCCESS);
+    ExpectIntEQ(first, (int)sizeof(earlyMsg));
+    ExpectIntEQ(replay, 0);
+    ExpectIntEQ(replayAgain, 0);
+    ExpectStrNE(replayBuf, earlyMsg);
+#endif
+    return EXPECT_RESULT();
+}
+
+/* A notification remove callback must not make the server treat a cache miss
+ * as single-use consumption. Replaying one captured early-data flight has to
+ * stay rejected after the first delivery, including a second replay. */
+int test_tls13_0rtt_captured_flight_notify_remove(void)
+{
+    EXPECT_DECLS;
+#if defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES) && \
+    defined(WOLFSSL_TLS13) && defined(WOLFSSL_EARLY_DATA) && \
+    defined(HAVE_SESSION_TICKET) && defined(WOLFSSL_TICKET_HAVE_ID) && \
+    !defined(NO_SESSION_CACHE) && defined(HAVE_EXT_CACHE) && \
+    !defined(WOLFSSL_NO_DEF_TICKET_ENC_CB)
+    int first = -1, replay = -1, replayAgain = -1;
+    char replayBuf[32];
+    const char earlyMsg[] = "replay-early-data";
+
+    ExpectIntEQ(test_tls13_run_captured_flight(1, &first, &replay,
+                    &replayAgain, replayBuf, (int)sizeof(replayBuf)),
+                TEST_SUCCESS);
+    ExpectIntEQ(first, (int)sizeof(earlyMsg));
+    ExpectIntEQ(replay, 0);
+    ExpectStrEQ(replayBuf, "");
+    ExpectIntEQ(replayAgain, 0);
+    ExpectStrNE(replayBuf, earlyMsg);
+#endif
+    return EXPECT_RESULT();
+}
+
 /* Check that the client won't send the same CH after a HRR. An HRR without
  * a KeyShare or a Cookie extension will trigger the error. */
 int test_tls13_same_ch(void)
