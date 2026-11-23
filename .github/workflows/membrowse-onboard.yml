@@ -50,7 +50,10 @@ jobs:
           ghcr-debs-tag: ${{ matrix.ghcr_tag }}
 
       - name: Run Membrowse Onboard Action
-        uses: membrowse/membrowse-action/onboard-action@v1
+        # Pinned to a full commit SHA: this step holds MEMBROWSE_API_KEY, so a
+        # moved tag must not be able to swap the action out from under it.
+        # v1.2.9.
+        uses: membrowse/membrowse-action/onboard-action@3f23ea562abaa6614855d6be5ec83b3cd1d274dd
         with:
           target_name: ${{ matrix.target_name }}
           num_commits: ${{ github.event.inputs.num_commits }}
