@@ -32,10 +32,23 @@
 #ifndef NO_CERTS
 
 #ifdef OPENSSL_EXTRA
+/* What a certificate must prove before X509StoreAddCa() adds it to the
+ * CertManager. */
+enum {
+    /* The caller has already decided. */
+    X509_STORE_REQ_NONE = 0,
+    /* Trust anchor: issuer and subject equal in DER and the signature
+     * verifies under the certificate's own public key. */
+    X509_STORE_REQ_SELF_SIGNED,
+    /* Intermediate: a CA whose signature verifies under a CA already in the
+     * CertManager. */
+    X509_STORE_REQ_CHAINED
+};
+
 static int X509StoreGetIssuerEx(WOLFSSL_X509 **issuer,
                             WOLFSSL_STACK *certs, WOLFSSL_X509 *x);
 static int X509StoreAddCa(WOLFSSL_X509_STORE* store,
-                                          WOLFSSL_X509* x509, int type);
+                                    WOLFSSL_X509* x509, int type, int req);
 #endif
 
 /* Based on OpenSSL default max depth */
@@ -640,6 +653,60 @@ static int X509StoreVerifyCert(WOLFSSL_X509_STORE_CTX* ctx, int* cbRejected)
     return ret;
 }
 
+/* Decide from the DER encoding whether a certificate is its own issuer.
+ *
+ * wolfSSL_X509_NAME_cmp() and wolfSSL_X509_check_issued() compare the display
+ * form of the names, which drops the ASN.1 string type and stops at an
+ * embedded NUL, so names that differ in DER can compare equal there. Use the
+ * issuer and subject name hashes of the decoded certificate instead.
+ *
+ * When checkSig is set the signature must also verify under the
+ * certificate's own public key.
+ *
+ * Returns 0 when the certificate is self-issued (and self-signed when
+ * checkSig is set), a negative error code otherwise. */
+static int X509StoreDerSelfIssued(const byte* der, word32 derSz, void* heap,
+    int checkSig)
+{
+    int ret;
+    word32 keyOID;
+    WC_DECLARE_VAR(cert, DecodedCert, 1, 0);
+
+    if (der == NULL || derSz == 0)
+        return BAD_FUNC_ARG;
+
+    WC_ALLOC_VAR_EX(cert, DecodedCert, 1, heap, DYNAMIC_TYPE_DCERT,
+        return MEMORY_E);
+
+    InitDecodedCert(cert, der, derSz, heap);
+    ret = ParseCertRelative(cert, CERT_TYPE, NO_VERIFY, NULL, NULL);
+    if (ret == 0 && !cert->selfSigned) {
+        ret = ASN_NO_SIGNER_E;
+    }
+    if (ret == 0 && checkSig) {
+        keyOID = cert->keyOID;
+    #if defined(WOLFSSL_SM2) && defined(WOLFSSL_SM3)
+        if (cert->signatureOID == CTC_SM3wSM2) {
+            keyOID = SM2k;
+        }
+    #endif
+        ret = CheckCertSignaturePubKey(der, derSz, heap, cert->publicKey,
+            cert->pubKeySize, (int)keyOID);
+    }
+    FreeDecodedCert(cert);
+    WC_FREE_VAR_EX(cert, heap, DYNAMIC_TYPE_DCERT);
+
+    return ret;
+}
+
+static int X509StoreIsSelfIssued(const WOLFSSL_X509* x509, int checkSig)
+{
+    if (x509 == NULL || x509->derCert == NULL)
+        return 0;
+    return X509StoreDerSelfIssued(x509->derCert->buffer,
+        x509->derCert->length, x509->heap, checkSig) == 0;
+}
+
 static int addAllButSelfSigned(WOLF_STACK_OF(WOLFSSL_X509)*to,
                                WOLF_STACK_OF(WOLFSSL_X509)*from, int *numAdded)
 {
@@ -884,8 +951,7 @@ static int X509StoreCheckPathLen(WOLFSSL_X509_STORE_CTX* ctx)
         if (cert == NULL)
             continue;
 
-        selfIssued =
-            (wolfSSL_X509_NAME_cmp(&cert->issuer, &cert->subject) == 0);
+        selfIssued = X509StoreIsSelfIssued(cert, 0);
 
         /* RFC 5280 sec. 6.1.4 (l): a non-self-issued *CA* certificate consumes
          * one unit of the issuer's remaining path length budget. Gate on isCa
@@ -1037,6 +1103,14 @@ int wolfSSL_X509_verify_cert(WOLFSSL_X509_STORE_CTX* ctx)
         /* Try to find an untrusted issuer first */
         ret = X509StoreGetIssuerEx(&issuer, certs,
                                                ctx->current_cert);
+        if (ret == WOLFSSL_SUCCESS && ctx->current_cert == issuer &&
+                !X509StoreIsSelfIssued(issuer, 1)) {
+            /* The issuer lookup compares display names. A certificate that
+             * is not self-signed in DER cannot end the chain, so look for
+             * its issuer in the CertManager instead. */
+            issuer = NULL;
+            ret = WOLFSSL_FAILURE;
+        }
         if (ret == WOLFSSL_SUCCESS) {
             if (ctx->current_cert == issuer) {
                 X509StoreChainPush(ctx->chain, ctx->current_cert);
@@ -1067,7 +1141,8 @@ int wolfSSL_X509_verify_cert(WOLFSSL_X509_STORE_CTX* ctx)
                 }
             }
         #endif
-            ret = X509StoreAddCa(ctx->store, issuer, WOLFSSL_TEMP_CA);
+            ret = X509StoreAddCa(ctx->store, issuer, WOLFSSL_TEMP_CA,
+                X509_STORE_REQ_NONE);
             if (ret != WOLFSSL_SUCCESS) {
                 X509VerifyCertSetupRetry(ctx, certs, failedCerts,
                     &depth, origDepth);
@@ -2124,15 +2199,49 @@ WOLFSSL_X509_LOOKUP* wolfSSL_X509_STORE_add_lookup(WOLFSSL_X509_STORE* store,
     return &store->lookup;
 }
 
+/* Check that the DER encoded certificate meets req (X509_STORE_REQ_*).
+ * Returns 0 when it does, a negative error code otherwise. */
+static int X509StoreCheckCaReq(WOLFSSL_X509_STORE* store, const byte* der,
+    word32 derSz, int req, int verify)
+{
+    int ret;
+    WC_DECLARE_VAR(cert, DecodedCert, 1, 0);
+
+    if (req == X509_STORE_REQ_SELF_SIGNED) {
+        return X509StoreDerSelfIssued(der, derSz, store->cm->heap, 1);
+    }
+    if (req != X509_STORE_REQ_CHAINED) {
+        return 0;
+    }
+
+    WC_ALLOC_VAR_EX(cert, DecodedCert, 1, store->cm->heap, DYNAMIC_TYPE_DCERT,
+        return MEMORY_E);
+    InitDecodedCert(cert, der, derSz, store->cm->heap);
+    /* Verified like a chain certificate received in a handshake. */
+    ret = ParseCertRelative(cert, CHAIN_CERT_TYPE, verify, store->cm, NULL);
+    if (ret == 0 && !cert->isCA) {
+        ret = NOT_CA_ERROR;
+    }
+    FreeDecodedCert(cert);
+    WC_FREE_VAR_EX(cert, store->cm->heap, DYNAMIC_TYPE_DCERT);
+
+    return ret;
+}
+
+/* Add a copy of x509 to the store's CertManager as type, provided the copy
+ * meets req (X509_STORE_REQ_*).
+ * Returns WOLFSSL_SUCCESS when added, WOLFSSL_FAILURE when the certificate
+ * does not meet req and nothing was added, or a negative error code. */
 static int X509StoreAddCa(WOLFSSL_X509_STORE* store,
-                                          WOLFSSL_X509* x509, int type)
+                                    WOLFSSL_X509* x509, int type, int req)
 {
     int result = WC_NO_ERR_TRACE(WOLFSSL_FATAL_ERROR);
     DerBuffer* derCert = NULL;
     int verify = VERIFY;
 
     WOLFSSL_ENTER("X509StoreAddCa");
-    if (store != NULL && x509 != NULL && x509->derCert != NULL) {
+    if (store != NULL && store->cm != NULL && x509 != NULL &&
+            x509->derCert != NULL) {
         /* Check if NO_CHECK_TIME flag is set - if so, skip date validation */
         if (store->param != NULL &&
             (store->param->flags & WOLFSSL_NO_CHECK_TIME) != 0) {
@@ -2141,10 +2250,18 @@ static int X509StoreAddCa(WOLFSSL_X509_STORE* store,
         result = AllocDer(&derCert, x509->derCert->length,
             x509->derCert->type, NULL);
         if (result == 0) {
-            /* AddCA() frees the buffer. */
             XMEMCPY(derCert->buffer,
                             x509->derCert->buffer, x509->derCert->length);
-            result = AddCA(store->cm, &derCert, type, verify);
+            /* Decide on the same copy that is handed to AddCA(). */
+            if (X509StoreCheckCaReq(store, derCert->buffer, derCert->length,
+                    req, verify) != 0) {
+                FreeDer(&derCert);
+                result = WOLFSSL_FAILURE;
+            }
+            else {
+                /* AddCA() frees the buffer. */
+                result = AddCA(store->cm, &derCert, type, verify);
+            }
         }
     }
 
@@ -2159,13 +2276,19 @@ static int X509StoreAddCa(WOLFSSL_X509_STORE* store,
  * SSL_CTX_set_cert_store: self-signed CAs are already in the CM (added by
  * X509StoreAddCa during X509_STORE_add_cert), but non-self-signed intermediates
  * are only in store->certs and must be explicitly added to the CM so that all
- * verification paths (including CertManagerVerify) can find them. */
+ * verification paths (including CertManagerVerify) can find them.
+ *
+ * Every CA in the CM is a trust anchor, so an intermediate is only added once
+ * it verifies under a CA already there. Intermediates that never do are
+ * dropped and reported as a failure. */
 WOLFSSL_LOCAL int X509StorePushCertsToCM(WOLFSSL_X509_STORE* store)
 {
     int i;
     int num;
     int ret;
     int anyFail = 0;
+    int progress;
+    byte* added = NULL;
     WOLFSSL_X509* x509;
 
     WOLFSSL_ENTER("X509StorePushCertsToCM");
@@ -2173,33 +2296,16 @@ WOLFSSL_LOCAL int X509StorePushCertsToCM(WOLFSSL_X509_STORE* store)
     if (store == NULL || store->cm == NULL)
         return WOLFSSL_SUCCESS;
 
-    /* Push non-self-signed intermediates from store->certs into the CM. */
-    if (store->certs != NULL) {
-        num = wolfSSL_sk_X509_num(store->certs);
-        for (i = 0; i < num; i++) {
-            x509 = wolfSSL_sk_X509_value(store->certs, i);
-            if (x509 != NULL) {
-                ret = X509StoreAddCa(store, x509, WOLFSSL_USER_CA);
-                if (ret != WOLFSSL_SUCCESS) {
-                    WOLFSSL_MSG("X509StorePushCertsToCM: failed to add cert");
-                    anyFail = 1;
-                }
-            }
-        }
-        /* Free and NULL to mark store as CTX-owned. Future add_cert calls
-         * will go directly to the CertManager. */
-        wolfSSL_sk_X509_pop_free(store->certs, NULL);
-        store->certs = NULL;
-    }
-
-    /* Push trusted certs too. Self-signed CAs are typically already in the CM
-     * (added during X509_STORE_add_cert), but AddCA handles duplicates. */
+    /* Push trusted certs first so intermediates can verify against them.
+     * Self-signed CAs are typically already in the CM (added during
+     * X509_STORE_add_cert), but AddCA handles duplicates. */
     if (store->trusted != NULL) {
         num = wolfSSL_sk_X509_num(store->trusted);
         for (i = 0; i < num; i++) {
             x509 = wolfSSL_sk_X509_value(store->trusted, i);
             if (x509 != NULL) {
-                ret = X509StoreAddCa(store, x509, WOLFSSL_USER_CA);
+                ret = X509StoreAddCa(store, x509, WOLFSSL_USER_CA,
+                    X509_STORE_REQ_NONE);
                 if (ret != WOLFSSL_SUCCESS) {
                     WOLFSSL_MSG("X509StorePushCertsToCM: failed to add "
                                 "trusted cert");
@@ -2209,6 +2315,48 @@ WOLFSSL_LOCAL int X509StorePushCertsToCM(WOLFSSL_X509_STORE* store)
         }
         wolfSSL_sk_X509_pop_free(store->trusted, NULL);
         store->trusted = NULL;
+    }
+
+    /* Push non-self-signed intermediates from store->certs into the CM. */
+    if (store->certs != NULL) {
+        num = wolfSSL_sk_X509_num(store->certs);
+        if (num > 0) {
+            added = (byte*)XMALLOC((size_t)num, store->cm->heap,
+                DYNAMIC_TYPE_TMP_BUFFER);
+            if (added == NULL) {
+                anyFail = 1;
+            }
+        }
+        if (added != NULL) {
+            XMEMSET(added, 0, (size_t)num);
+            /* The stack is in no particular order and an intermediate can
+             * only be added once its issuer is in the CM. */
+            do {
+                progress = 0;
+                for (i = 0; i < num; i++) {
+                    if (added[i])
+                        continue;
+                    x509 = wolfSSL_sk_X509_value(store->certs, i);
+                    if (x509 == NULL ||
+                            X509StoreAddCa(store, x509, WOLFSSL_USER_INTER,
+                                X509_STORE_REQ_CHAINED) == WOLFSSL_SUCCESS) {
+                        added[i] = 1;
+                        progress = 1;
+                    }
+                }
+            } while (progress);
+            for (i = 0; i < num; i++) {
+                if (!added[i]) {
+                    WOLFSSL_MSG("X509StorePushCertsToCM: failed to add cert");
+                    anyFail = 1;
+                }
+            }
+            XFREE(added, store->cm->heap, DYNAMIC_TYPE_TMP_BUFFER);
+        }
+        /* Free and NULL to mark store as CTX-owned. Future add_cert calls
+         * will go directly to the CertManager. */
+        wolfSSL_sk_X509_pop_free(store->certs, NULL);
+        store->certs = NULL;
     }
 
     if (anyFail) {
@@ -2226,9 +2374,11 @@ int wolfSSL_X509_STORE_add_cert(WOLFSSL_X509_STORE* store, WOLFSSL_X509* x509)
                                                 && x509->derCert != NULL) {
         /* Mimic the openssl behavior, must be self signed to be considered
          * trusted, addCA() internals will do additional checks for
-         * CA=TRUE */
-        if (wolfSSL_X509_NAME_cmp(&x509->issuer, &x509->subject) == 0) {
-            result = X509StoreAddCa(store, x509, WOLFSSL_USER_CA);
+         * CA=TRUE. Self signed means the DER issuer and subject names are
+         * equal and the certificate's own key verifies its signature. */
+        result = X509StoreAddCa(store, x509, WOLFSSL_USER_CA,
+            X509_STORE_REQ_SELF_SIGNED);
+        if (result != WC_NO_ERR_TRACE(WOLFSSL_FAILURE)) {
             if (result == WOLFSSL_SUCCESS && store->trusted != NULL) {
                 result = wolfSSL_X509_up_ref(x509);
                 if (result == WOLFSSL_SUCCESS) {
@@ -2261,9 +2411,11 @@ int wolfSSL_X509_STORE_add_cert(WOLFSSL_X509_STORE* store, WOLFSSL_X509* x509)
             }
             else {
                 /* If store->certs is NULL, this is an X509_STORE managed by an
-                 * SSL_CTX, preserve behavior and always add as USER_CA */
-                result = X509StoreAddCa(
-                            store, x509, WOLFSSL_USER_CA);
+                 * SSL_CTX. There is no untrusted list to keep the
+                 * intermediate in, so add it to the CertManager, but only
+                 * when it verifies under a CA already there. */
+                result = X509StoreAddCa(store, x509, WOLFSSL_USER_INTER,
+                            X509_STORE_REQ_CHAINED);
             }
         }
     }
