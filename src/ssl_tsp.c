@@ -1596,16 +1596,24 @@ WOLFSSL_BIO* wolfSSL_TS_VERIFY_CTX_set_data(WOLFSSL_TS_VERIFY_CTX* ctx,
  *
  * Takes ownership of store - disposed of when the context is.
  *
+ * A store that is not reference counted - one that is part of an SSL/TLS
+ * context - cannot be owned and is refused, leaving ctx unchanged.
+ *
  * @param [in, out] ctx    TS_VERIFY_CTX object.
  * @param [in]      store  Store of trusted certificates. May be NULL.
  * @return  The store set.
- * @return  NULL when ctx is NULL or clearing the store.
+ * @return  NULL when ctx is NULL, store is not reference counted or clearing
+ *          the store.
  */
 WOLFSSL_X509_STORE* wolfSSL_TS_VERIFY_CTX_set_store(
     WOLFSSL_TS_VERIFY_CTX* ctx, WOLFSSL_X509_STORE* store)
 {
     if (ctx == NULL)
         return NULL;
+    if ((store != NULL) && !store->isDynamic) {
+        WOLFSSL_MSG("Store is not reference counted");
+        return NULL;
+    }
     wolfSSL_X509_STORE_free(ctx->store);
     /* Takes ownership of store. */
     ctx->store = store;

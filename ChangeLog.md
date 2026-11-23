@@ -38,6 +38,21 @@
   reference counting meant locking a mutex that was never set up.  A NULL
   store still returns 0.
 
+* **Behavioral change (setters refuse a store that is not reference
+  counted)**: `wolfSSL_CTX_set_cert_store()`,
+  `wolfSSL_CTX_set1_verify_cert_store()`, `wolfSSL_set0_verify_cert_store()`,
+  `wolfSSL_set1_verify_cert_store()` and `wolfSSL_TS_VERIFY_CTX_set_store()`
+  no longer keep a pointer to a store that was not allocated with
+  `wolfSSL_X509_STORE_new()`, such as the one `wolfSSL_CTX_get_cert_store()`
+  returns for a context with no store set on it.  Nothing kept such a store
+  alive, so freeing the context it belongs to left the other holder pointing
+  at freed memory.  The call now fails (returns 0, or NULL for
+  `wolfSSL_TS_VERIFY_CTX_set_store()`; `wolfSSL_CTX_set_cert_store()` returns
+  nothing) and leaves the destination unchanged.  Handing a context or an
+  object the store its own context is already using is still accepted.  To
+  share trust anchors between contexts, load them into a store from
+  `wolfSSL_X509_STORE_new()` and set that on each.
+
 * **Behavioral change (`wolfSSL_OCSP_parse_url` rewritten to follow OpenSSL)**:
   the parser now follows OpenSSL's `OCSP_parse_url()`, which is
   `OSSL_HTTP_parse_url()` with the userinfo, port number, query and fragment
