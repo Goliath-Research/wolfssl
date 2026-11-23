@@ -17808,6 +17808,38 @@ int ProcessPeerCerts(WOLFSSL* ssl, byte* input, word32* inOutIdx,
                 AddLateName("Certificate", &ssl->timeoutInfo);
         #endif
 
+        #ifdef HAVE_RPK
+            /* The server certificate type in effect (X.509 when the server
+             * did not select one) must be one this client offered, or the
+             * certificate would be authenticated by a mechanism the client
+             * did not agree to (RFC 7250 4.2). */
+            if (ssl->options.side == WOLFSSL_CLIENT_END &&
+                    ssl->options.rpkState.sending_ServerCertTypeCnt > 0) {
+                byte sType = WOLFSSL_CERT_TYPE_X509;
+                byte i;
+                int offered = 0;
+
+                if (ssl->options.rpkState.received_ServerCertTypeCnt == 1)
+                    sType = ssl->options.rpkState.received_ServerCertTypes[0];
+                for (i = 0;
+                     i < ssl->options.rpkState.sending_ServerCertTypeCnt &&
+                     i < MAX_SERVER_CERT_TYPE_CNT; i++) {
+                    if (ssl->options.rpkState.sending_ServerCertTypes[i] ==
+                            sType) {
+                        offered = 1;
+                        break;
+                    }
+                }
+                if (!offered) {
+                    WOLFSSL_MSG("Server certificate type was not offered");
+                    ret = UNSUPPORTED_CERTIFICATE;
+                    WOLFSSL_ERROR_VERBOSE(ret);
+                    DoCertFatalAlert(ssl, ret);
+                    goto exit_ppc;
+                }
+            }
+        #endif /* HAVE_RPK */
+
         #ifdef WOLFSSL_TLS13
             if (ssl->options.tls1_3) {
                 ret = DoCertReqCtx(ssl, args, input, totalSz);
