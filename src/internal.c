@@ -18743,15 +18743,31 @@ int ProcessPeerCerts(WOLFSSL* ssl, byte* input, word32* inOutIdx,
                         ret = KEYUSE_ENCIPHER_E;
                         WOLFSSL_ERROR_VERBOSE(ret);
                     }
+                    /* Static ECDH (RFC 4492 2.1-2.2, RFC 5480 3): the server
+                     * certificate key is the key-agreement key and does not
+                     * sign, so keyAgreement is required instead of
+                     * digitalSignature. A client certificate still signs
+                     * CertificateVerify and falls through to the signature
+                     * check below. */
+                    if (ssl->specs.static_ecdh &&
+                            !IsAtLeastTLSv1_3(ssl->version) &&
+                            (ssl->options.side == WOLFSSL_CLIENT_END)) {
+                        if ((args->dCert->extKeyUsage &
+                                KEYUSE_KEY_AGREE) == 0) {
+                            WOLFSSL_MSG("KeyUse Key Agreement not set");
+                            ret = KEYUSE_AGREEMENT_E;
+                            WOLFSSL_ERROR_VERBOSE(ret);
+                        }
+                    }
                     /* TLS 1.3 decouples sig algorithm from cipher suite, so
                      * specs.sig_algo is any_sa_algo. RFC 8446 4.4.2.4 still
                      * requires digital_signature when keyUsage is present on
                      * the cert that drives CertificateVerify. */
-                    if (((ssl->specs.kea != rsa_kea) &&
+                    else if (((ssl->specs.kea != rsa_kea ||
+                               ssl->options.side == WOLFSSL_SERVER_END) &&
                             (IsAtLeastTLSv1_3(ssl->version) ||
                              ssl->specs.sig_algo == rsa_sa_algo ||
-                                (ssl->specs.sig_algo == ecc_dsa_sa_algo &&
-                                     !ssl->specs.static_ecdh))) &&
+                             ssl->specs.sig_algo == ecc_dsa_sa_algo)) &&
                         (args->dCert->extKeyUsage & KEYUSE_DIGITAL_SIG) == 0) {
                         WOLFSSL_MSG("KeyUse Digital Sig not set");
                         ret = KEYUSE_SIGNATURE_E;
@@ -29782,6 +29798,9 @@ const char* wolfSSL_ERR_reason_error_string(unsigned long e)
 
     case KEYUSE_ENCIPHER_E:
         return "Key Use keyEncipherment not set Error";
+
+    case KEYUSE_AGREEMENT_E:
+        return "Key Use keyAgreement not set Error";
 
     case EXTKEYUSE_AUTH_E:
         return "Ext Key Use server/client auth not set Error";
