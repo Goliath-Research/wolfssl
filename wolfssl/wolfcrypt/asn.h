@@ -2228,6 +2228,11 @@ struct DecodedCert {
 #endif
 #ifdef HAVE_RPK
     WC_BITFIELD isRPK:1;   /* indicate the cert is Raw-Public-Key cert in RFC7250 */
+    /* Set by a caller that authenticates a Raw Public Key itself (e.g. against
+     * an out-of-band pin). A Raw Public Key has no issuer or signature, so when
+     * this is clear ParseCertRelative() rejects one whenever verification is
+     * requested instead of reporting it as trusted. */
+    WC_BITFIELD rpkTrustOutOfBand:1;
 #endif
 #ifdef WC_ASN_UNKNOWN_EXT_CB
     wc_UnknownExtCallback unknownExtCallback;

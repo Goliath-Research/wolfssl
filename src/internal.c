@@ -16573,6 +16573,11 @@ PRAGMA_GCC_DIAG_POP
         extraSigners = TLSX_CSR2_GetPendingSigners(ssl->extensions);
     }
 #endif
+#if defined(HAVE_RPK)
+    /* Only the peer's leaf may be a Raw Public Key; it is authenticated below
+     * against the negotiated certificate type and the expected RPK pins. */
+    args->dCert->rpkTrustOutOfBand = (certType == CERT_TYPE);
+#endif
     /* Parse Certificate */
     ret = ParseCertRelative(args->dCert, certType, verify, SSL_CM(ssl), extraSigners);
 
@@ -42721,8 +42726,20 @@ static int AddPSKtoPreMasterSecret(WOLFSSL* ssl)
                 InitDecodedCert(dCert, it->peerCert, peerCertLen, ssl->heap);
                 /* Re-verify against the current trust store so that CA
                  * removal since ticket issue is enforced. */
+            #if defined(HAVE_RPK) && \
+                (!defined(NO_WOLFSSL_CLIENT) || !defined(WOLFSSL_NO_CLIENT_AUTH))
+                dCert->rpkTrustOutOfBand = 1;
+            #endif
                 ret = ParseCertRelative(dCert, CERT_TYPE, verify,
                                         SSL_CM(ssl), NULL);
+            #if defined(HAVE_RPK) && \
+                (!defined(NO_WOLFSSL_CLIENT) || !defined(WOLFSSL_NO_CLIENT_AUTH))
+                /* A Raw Public Key is only trusted while it is still pinned. */
+                if (ret == 0 && verify != NO_VERIFY && dCert->isRPK &&
+                        !RpkIsTrusted(ssl, it->peerCert, peerCertLen)) {
+                    ret = RPK_UNTRUSTED_E;
+                }
+            #endif
             #ifdef HAVE_OCSP
                 /* ParseCertRelative does not check revocation status.
                  * Run OCSP if the CertManager has it enabled. */
