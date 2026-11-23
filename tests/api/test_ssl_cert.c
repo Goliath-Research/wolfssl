@@ -1280,6 +1280,362 @@ int test_wolfSSL_verify_cert_store_follows_ctx(void)
     return EXPECT_RESULT();
 }
 
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+/* Handshake ssl_c against a fresh in-memory server.
+ *
+ * The client object is the one the caller configured. A new object would not
+ * carry a store pointer pinned on the original, so the caller passes the
+ * object that is supposed to verify.
+ *
+ * @param [in] ssl_c  Client object. Not freed.
+ * @return  0 when the handshake completes.
+ * @return  -1 on setup or handshake failure.
+ */
+static int test_embedded_store_handshake(WOLFSSL* ssl_c)
+{
+    struct test_memio_ctx io;
+    WOLFSSL_CTX* ctx_s = NULL;
+    WOLFSSL* ssl_s = NULL;
+    int hs;
+
+    XMEMSET(&io, 0, sizeof(io));
+    if (test_memio_setup(&io, NULL, &ctx_s, NULL, &ssl_s,
+            wolfTLSv1_2_client_method, wolfTLSv1_2_server_method) != 0) {
+        return -1;
+    }
+
+    wolfSSL_SSLSetIORecv(ssl_c, test_memio_read_cb);
+    wolfSSL_SSLSetIOSend(ssl_c, test_memio_write_cb);
+    wolfSSL_SetIOReadCtx(ssl_c, &io);
+    wolfSSL_SetIOWriteCtx(ssl_c, &io);
+    hs = test_memio_do_handshake(ssl_c, ssl_s, 10, NULL);
+
+    wolfSSL_free(ssl_s);
+    wolfSSL_CTX_free(ctx_s);
+    return hs;
+}
+
+/* Build the two contexts used to share an embedded store.
+ *
+ * The source store is the one embedded in src (isDynamic == 0). The
+ * destination has the test CA in its own certificate manager and no external
+ * store pointer. Allocations are not wrapped in Expect so a later failure
+ * cannot skip them.
+ *
+ * @param [out] src       Source context. Caller frees.
+ * @param [out] dst       Destination context. Caller frees.
+ * @param [out] srcStore  Source embedded store.
+ * @param [out] dstStore  Destination embedded store.
+ * @return  0 on success.
+ * @return  -1 on setup failure.
+ */
+static int test_embedded_store_pair(WOLFSSL_CTX** src, WOLFSSL_CTX** dst,
+    WOLFSSL_X509_STORE** srcStore, WOLFSSL_X509_STORE** dstStore)
+{
+    *src = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    *dst = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    if ((*src == NULL) || (*dst == NULL)) {
+        return -1;
+    }
+    if (wolfSSL_CTX_load_verify_locations(*dst, caCertFile, NULL) !=
+            WOLFSSL_SUCCESS) {
+        return -1;
+    }
+    *srcStore = wolfSSL_CTX_get_cert_store(*src);
+    *dstStore = wolfSSL_CTX_get_cert_store(*dst);
+    if ((*srcStore == NULL) || (*dstStore == NULL) ||
+            ((*srcStore)->isDynamic != 0) || ((*dst)->x509_store_pt != NULL) ||
+            (*dstStore != &(*dst)->x509_store)) {
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+/* wolfSSL_CTX_set1_verify_cert_store() must not keep another context's
+ * embedded store. The call fails, the destination is unchanged, and a
+ * handshake after the source context is freed still verifies with the
+ * destination's own CA.
+ *
+ * A store from wolfSSL_X509_STORE_new() is reference counted and is still
+ * accepted. Handing a context its own embedded store stays a no-op.
+ *
+ * @return  TEST_SUCCESS on success.
+ */
+int test_wolfSSL_CTX_set1_verify_cert_store_embedded(void)
+{
+    EXPECT_DECLS;
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+    WOLFSSL_CTX* src = NULL;
+    WOLFSSL_CTX* dst = NULL;
+    WOLFSSL_CTX* countedCtx = NULL;
+    WOLFSSL_CTX* same = NULL;
+    WOLFSSL* ssl = NULL;
+    WOLFSSL_X509_STORE* srcStore = NULL;
+    WOLFSSL_X509_STORE* dstStore = NULL;
+    WOLFSSL_X509_STORE* dyn = NULL;
+    WOLFSSL_X509_STORE* sameStore = NULL;
+    int setRet = -1;
+    int hs = -1;
+
+    wolfSSL_Debugging_OFF();
+
+    /* Counted stores are still shared. */
+    countedCtx = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    dyn = wolfSSL_X509_STORE_new();
+    ExpectNotNull(countedCtx);
+    ExpectNotNull(dyn);
+    if (dyn != NULL) {
+        ExpectIntEQ(dyn->isDynamic, 1);
+        ExpectIntEQ(wolfSSL_X509_STORE_load_locations(dyn, caCertFile, NULL),
+            WOLFSSL_SUCCESS);
+    }
+    if ((countedCtx != NULL) && (dyn != NULL)) {
+        ExpectIntEQ(wolfSSL_CTX_set1_verify_cert_store(countedCtx, dyn), 1);
+        ExpectPtrEq(wolfSSL_CTX_get_cert_store(countedCtx), dyn);
+        ssl = wolfSSL_new(countedCtx);
+        if (ssl != NULL) {
+            hs = test_embedded_store_handshake(ssl);
+            ExpectIntEQ(hs, 0);
+            wolfSSL_free(ssl);
+            ssl = NULL;
+        }
+    }
+
+    /* A context's own embedded store is not installed as an external one. */
+    same = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    ExpectNotNull(same);
+    if (same != NULL) {
+        sameStore = wolfSSL_CTX_get_cert_store(same);
+        ExpectIntEQ(wolfSSL_CTX_set1_verify_cert_store(same, sameStore), 1);
+        ExpectPtrEq(wolfSSL_CTX_get_cert_store(same), sameStore);
+        ExpectNull(same->x509_store_pt);
+    }
+
+    /* Another context's embedded store is refused and not retained. */
+    ExpectIntEQ(test_embedded_store_pair(&src, &dst, &srcStore, &dstStore), 0);
+    if ((dst != NULL) && (srcStore != NULL)) {
+        setRet = wolfSSL_CTX_set1_verify_cert_store(dst, srcStore);
+    }
+    ExpectIntEQ(setRet, 0);
+    if (dst != NULL) {
+        ExpectPtrEq(wolfSSL_CTX_get_cert_store(dst), dstStore);
+        ExpectNull(dst->x509_store_pt);
+    }
+    wolfSSL_CTX_free(src);
+    src = NULL;
+    if (dst != NULL) {
+        ssl = wolfSSL_new(dst);
+    }
+    if (ssl != NULL) {
+        hs = test_embedded_store_handshake(ssl);
+        ExpectIntEQ(hs, 0);
+        wolfSSL_free(ssl);
+    }
+
+    wolfSSL_X509_STORE_free(dyn);
+    wolfSSL_CTX_free(countedCtx);
+    wolfSSL_CTX_free(same);
+    wolfSSL_CTX_free(dst);
+#endif
+    return EXPECT_RESULT();
+}
+
+/* Refusing an embedded store must not drop a counted store already installed.
+ * The handshake after the source is freed uses that counted store's CA.
+ *
+ * @return  TEST_SUCCESS on success.
+ */
+int test_wolfSSL_CTX_set1_verify_cert_store_keeps_ref(void)
+{
+    EXPECT_DECLS;
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+    WOLFSSL_CTX* src = NULL;
+    WOLFSSL_CTX* dst = NULL;
+    WOLFSSL* ssl = NULL;
+    WOLFSSL_X509_STORE* srcStore = NULL;
+    WOLFSSL_X509_STORE* dyn = NULL;
+    int setRet = -1;
+    int hs = -1;
+
+    wolfSSL_Debugging_OFF();
+
+    src = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    dst = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+    dyn = wolfSSL_X509_STORE_new();
+    ExpectNotNull(src);
+    ExpectNotNull(dst);
+    ExpectNotNull(dyn);
+    if (dyn != NULL) {
+        ExpectIntEQ(wolfSSL_X509_STORE_load_locations(dyn, caCertFile, NULL),
+            WOLFSSL_SUCCESS);
+    }
+    if ((dst != NULL) && (dyn != NULL)) {
+        ExpectIntEQ(wolfSSL_CTX_set1_verify_cert_store(dst, dyn), 1);
+    }
+    if (src != NULL) {
+        srcStore = wolfSSL_CTX_get_cert_store(src);
+    }
+    if ((dst != NULL) && (srcStore != NULL)) {
+        setRet = wolfSSL_CTX_set1_verify_cert_store(dst, srcStore);
+    }
+    ExpectIntEQ(setRet, 0);
+    ExpectPtrEq(wolfSSL_CTX_get_cert_store(dst), dyn);
+    wolfSSL_CTX_free(src);
+    src = NULL;
+    if (dst != NULL) {
+        ssl = wolfSSL_new(dst);
+    }
+    if (ssl != NULL) {
+        hs = test_embedded_store_handshake(ssl);
+        ExpectIntEQ(hs, 0);
+        wolfSSL_free(ssl);
+    }
+
+    wolfSSL_X509_STORE_free(dyn);
+    wolfSSL_CTX_free(dst);
+#endif
+    return EXPECT_RESULT();
+}
+
+/* wolfSSL_set1_verify_cert_store() must not pin another context's embedded
+ * store onto an SSL object. After the source context is freed, the object
+ * still verifies with its own context's CA.
+ *
+ * @return  TEST_SUCCESS on success.
+ */
+int test_wolfSSL_set1_verify_cert_store_embedded(void)
+{
+    EXPECT_DECLS;
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+    WOLFSSL_CTX* src = NULL;
+    WOLFSSL_CTX* dst = NULL;
+    WOLFSSL* ssl = NULL;
+    WOLFSSL_X509_STORE* srcStore = NULL;
+    WOLFSSL_X509_STORE* dstStore = NULL;
+    int setRet = -1;
+    int hs = -1;
+
+    wolfSSL_Debugging_OFF();
+
+    ExpectIntEQ(test_embedded_store_pair(&src, &dst, &srcStore, &dstStore), 0);
+    if (dst != NULL) {
+        ssl = wolfSSL_new(dst);
+    }
+    if ((ssl != NULL) && (srcStore != NULL)) {
+        setRet = wolfSSL_set1_verify_cert_store(ssl, srcStore);
+    }
+    ExpectIntEQ(setRet, 0);
+    if (ssl != NULL) {
+        ExpectNull(ssl->x509_store_pt);
+    }
+    wolfSSL_CTX_free(src);
+    src = NULL;
+    if (ssl != NULL) {
+        hs = test_embedded_store_handshake(ssl);
+        ExpectIntEQ(hs, 0);
+        wolfSSL_free(ssl);
+    }
+    wolfSSL_CTX_free(dst);
+#endif
+    return EXPECT_RESULT();
+}
+
+/* wolfSSL_set0_verify_cert_store() must not keep another context's embedded
+ * store either. set0 does not take a reference, and this store has none.
+ *
+ * @return  TEST_SUCCESS on success.
+ */
+int test_wolfSSL_set0_verify_cert_store_embedded(void)
+{
+    EXPECT_DECLS;
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+    WOLFSSL_CTX* src = NULL;
+    WOLFSSL_CTX* dst = NULL;
+    WOLFSSL* ssl = NULL;
+    WOLFSSL_X509_STORE* srcStore = NULL;
+    WOLFSSL_X509_STORE* dstStore = NULL;
+    int setRet = -1;
+    int hs = -1;
+
+    wolfSSL_Debugging_OFF();
+
+    ExpectIntEQ(test_embedded_store_pair(&src, &dst, &srcStore, &dstStore), 0);
+    if (dst != NULL) {
+        ssl = wolfSSL_new(dst);
+    }
+    if ((ssl != NULL) && (srcStore != NULL)) {
+        setRet = wolfSSL_set0_verify_cert_store(ssl, srcStore);
+    }
+    ExpectIntEQ(setRet, 0);
+    if (ssl != NULL) {
+        ExpectNull(ssl->x509_store_pt);
+    }
+    wolfSSL_CTX_free(src);
+    src = NULL;
+    if (ssl != NULL) {
+        hs = test_embedded_store_handshake(ssl);
+        ExpectIntEQ(hs, 0);
+        wolfSSL_free(ssl);
+    }
+    wolfSSL_CTX_free(dst);
+#endif
+    return EXPECT_RESULT();
+}
+
+/* wolfSSL_CTX_set_cert_store() must not keep another context's embedded store
+ * or adopt that store's certificate manager. The destination keeps verifying
+ * with the CA loaded into its own manager after the source is freed.
+ *
+ * @return  TEST_SUCCESS on success.
+ */
+int test_wolfSSL_CTX_set_cert_store_embedded(void)
+{
+    EXPECT_DECLS;
+#if defined(OPENSSL_ALL) && !defined(NO_CERTS) && !defined(NO_TLS) && \
+    !defined(WOLFSSL_NO_TLS12) && defined(HAVE_MANUAL_MEMIO_TESTS_DEPENDENCIES)
+    WOLFSSL_CTX* src = NULL;
+    WOLFSSL_CTX* dst = NULL;
+    WOLFSSL* ssl = NULL;
+    WOLFSSL_X509_STORE* srcStore = NULL;
+    WOLFSSL_X509_STORE* dstStore = NULL;
+    WOLFSSL_CERT_MANAGER* dstCm = NULL;
+    int hs = -1;
+
+    wolfSSL_Debugging_OFF();
+
+    ExpectIntEQ(test_embedded_store_pair(&src, &dst, &srcStore, &dstStore), 0);
+    if (dst != NULL) {
+        dstCm = dst->cm;
+    }
+    if ((dst != NULL) && (srcStore != NULL)) {
+        wolfSSL_CTX_set_cert_store(dst, srcStore);
+    }
+    if (dst != NULL) {
+        ExpectPtrEq(dst->cm, dstCm);
+        ExpectNull(dst->x509_store_pt);
+        ExpectPtrEq(wolfSSL_CTX_get_cert_store(dst), dstStore);
+    }
+    wolfSSL_CTX_free(src);
+    src = NULL;
+    if (dst != NULL) {
+        ssl = wolfSSL_new(dst);
+    }
+    if (ssl != NULL) {
+        hs = test_embedded_store_handshake(ssl);
+        ExpectIntEQ(hs, 0);
+        wolfSSL_free(ssl);
+    }
+    wolfSSL_CTX_free(dst);
+#endif
+    return EXPECT_RESULT();
+}
+
 /* Test that releasing a store the certificate manager is paired with does not
  * leave the manager pointing at it.
  *
